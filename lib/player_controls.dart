@@ -779,6 +779,7 @@ class _PlayerControlsState extends State<PlayerControls> {
     required double volume,
   }) {
     final tools = [
+      if (widget.onSettings != null) _settingsTool(),
       if (showSpeedQuality) ...[
         _toolText(
           key: const ValueKey('player-speed'),
@@ -824,7 +825,6 @@ class _PlayerControlsState extends State<PlayerControls> {
               ? () => _panel(widget.onPictureInPicture!)
               : null,
         ),
-      if (widget.onSettings != null) _settingsTool(),
       _toolIcon(
         key: const ValueKey('player-fullscreen'),
         tooltip: fullscreen ? '退出全屏' : '旋转与全屏',
@@ -842,6 +842,7 @@ class _PlayerControlsState extends State<PlayerControls> {
 
   Widget _mobileControlRow({required bool fullscreen}) {
     final tools = [
+      if (widget.onSettings != null) _settingsTool(),
       _toolText(
         key: const ValueKey('player-speed'),
         tooltip: '倍速',
@@ -874,7 +875,6 @@ class _PlayerControlsState extends State<PlayerControls> {
               ? () => _panel(widget.onPictureInPicture!)
               : null,
         ),
-      if (widget.onSettings != null) _settingsTool(),
     ];
     return Padding(
       padding: const EdgeInsets.fromLTRB(2, 0, 2, 0),
