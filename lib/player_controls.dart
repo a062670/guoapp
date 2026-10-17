@@ -78,7 +78,9 @@ class PlayerControls extends StatefulWidget {
 class _PlayerControlsState extends State<PlayerControls> {
   final List<StreamSubscription<dynamic>> _subscriptions = [];
   Timer? _hideTimer;
+  Timer? _cursorTimer;
   bool _visible = true;
+  bool _cursorVisible = false;
   bool _suppressAutoPlaybackStart = false;
   bool _lastPlaying = false;
   double? _seekValue;
@@ -191,6 +193,15 @@ class _PlayerControlsState extends State<PlayerControls> {
     _scheduleHide();
   }
 
+  void _revealCursor() {
+    if (!mounted) return;
+    if (!_cursorVisible) setState(() => _cursorVisible = true);
+    _cursorTimer?.cancel();
+    _cursorTimer = Timer(const Duration(seconds: 2), () {
+      if (mounted) setState(() => _cursorVisible = false);
+    });
+  }
+
   void _tap() {
     if (widget.interactions.suppressTap) return;
     widget.onFocusSurface();
@@ -208,6 +219,7 @@ class _PlayerControlsState extends State<PlayerControls> {
   @override
   void dispose() {
     _hideTimer?.cancel();
+    _cursorTimer?.cancel();
     widget.interactions.removeListener(_interactionChanged);
     for (final subscription in _subscriptions) {
       subscription.cancel();
@@ -224,8 +236,10 @@ class _PlayerControlsState extends State<PlayerControls> {
     final visible =
         _visible || !state.playing || state.buffering || widget.panelOpen;
     return MouseRegion(
-      onHover: (_) => _show(),
-      cursor: visible ? SystemMouseCursors.basic : SystemMouseCursors.none,
+      onHover: (_) => _revealCursor(),
+      cursor: visible || _cursorVisible
+          ? SystemMouseCursors.basic
+          : SystemMouseCursors.none,
       child: LayoutBuilder(
         builder: (context, constraints) => Stack(
           fit: StackFit.expand,
@@ -1005,8 +1019,8 @@ class _PlayerControlsState extends State<PlayerControls> {
         final icon = value < 0.33
             ? Icons.brightness_low_rounded
             : value < 0.66
-                ? Icons.brightness_medium_rounded
-                : Icons.brightness_high_rounded;
+            ? Icons.brightness_medium_rounded
+            : Icons.brightness_high_rounded;
         return IgnorePointer(
           child: Center(
             child: Container(
@@ -1015,7 +1029,10 @@ class _PlayerControlsState extends State<PlayerControls> {
               decoration: BoxDecoration(
                 color: Colors.black.withValues(alpha: .75),
                 borderRadius: BorderRadius.circular(16),
-                border: Border.all(color: Colors.white.withValues(alpha: .15), width: 1),
+                border: Border.all(
+                  color: Colors.white.withValues(alpha: .15),
+                  width: 1,
+                ),
                 boxShadow: [
                   BoxShadow(
                     color: Colors.black.withValues(alpha: .4),
@@ -1037,7 +1054,9 @@ class _PlayerControlsState extends State<PlayerControls> {
                       child: LinearProgressIndicator(
                         value: value,
                         backgroundColor: Colors.white24,
-                        valueColor: const AlwaysStoppedAnimation<Color>(Colors.white),
+                        valueColor: const AlwaysStoppedAnimation<Color>(
+                          Colors.white,
+                        ),
                       ),
                     ),
                   ),
