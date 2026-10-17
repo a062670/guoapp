@@ -95,6 +95,7 @@ class _PlayerScreenState extends State<PlayerScreen>
   Timer? _healthTimer;
   Timer? _errorTimer;
   Timer? _pictureInPictureExitTimer;
+  Timer? _volumeSaveTimer;
   Future<void> _operations = Future<void>.value();
   late int _index;
   late final int _profileEpoch;
@@ -128,6 +129,7 @@ class _PlayerScreenState extends State<PlayerScreen>
   PlaybackPlan? _plan;
   double _speed = 1;
   double _holdSpeed = defaultHoldSpeed;
+  double _volume = 100;
   double _aspectRatio = 9 / 16;
   double _resumePosition = 0;
   bool _rotating = false;
@@ -152,6 +154,7 @@ class _PlayerScreenState extends State<PlayerScreen>
     autoAdvance: _autoAdvance,
     danmaku: _danmakuEnabled,
     preload: _preloadEnabled,
+    volume: _volume,
     enhancement: _enhancement.preferences,
   );
   String get _qualityLabel => _plan?.local == true
@@ -174,6 +177,7 @@ class _PlayerScreenState extends State<PlayerScreen>
     final preferences = widget.store.playbackPreferences;
     _speed = preferences.speed;
     _holdSpeed = preferences.holdSpeed;
+    _volume = preferences.volume;
     _requestedQuality = preferences.quality;
     _autoAdvance = true;
     _danmakuEnabled = preferences.danmaku;
@@ -234,6 +238,8 @@ class _PlayerScreenState extends State<PlayerScreen>
       if (!_playerFocus.hasPrimaryFocus && !_closed) _interactions.cancel();
     });
     _configurePictureInPicture();
+    unawaited(_player.setVolume(_volume).catchError((Object _) {}));
+    _subscriptions.add(_player.stream.volume.listen(_volumeChanged));
     _subscriptions.add(
       _player.stream.error.listen((error) {
         if (_enhancement.handlePlaybackError(error)) return;
@@ -1202,6 +1208,26 @@ class _PlayerScreenState extends State<PlayerScreen>
     ).showSnackBar(SnackBar(content: Text(message)));
   }
 
+  void _volumeChanged(double volume) {
+    if (_closed || !volume.isFinite) return;
+    _volume = volume.clamp(0.0, 100.0).toDouble();
+    _volumeSaveTimer?.cancel();
+    _volumeSaveTimer = Timer(const Duration(milliseconds: 800), _persistVolume);
+  }
+
+  void _persistVolume() {
+    _volumeSaveTimer?.cancel();
+    _volumeSaveTimer = null;
+    if (widget.store.profileEpoch != _profileEpoch) return;
+    final saved = widget.store.playbackPreferences;
+    if ((saved.volume - _volume).abs() < .5) return;
+    unawaited(
+      widget.store
+          .setPlaybackPreferences(saved.copyWith(volume: _volume))
+          .catchError((Object _) {}),
+    );
+  }
+
   Future<void> _setPreferences(PlaybackPreferences preferences) async {
     if (_closed || widget.store.profileEpoch != _profileEpoch) {
       throw StateError('当前用户已变更');
@@ -1210,6 +1236,7 @@ class _PlayerScreenState extends State<PlayerScreen>
     final nextPreferences = preferences.copyWith(
       autoAdvance: true,
       preload: true,
+      volume: _volume,
     );
     await widget.store.setPlaybackPreferences(nextPreferences);
     if (!mounted || _closed || widget.store.profileEpoch != _profileEpoch)
@@ -1468,6 +1495,7 @@ class _PlayerScreenState extends State<PlayerScreen>
 
   @override
   void dispose() {
+    if (_volumeSaveTimer != null) _persistVolume();
     _closed = true;
     final enhancementClosed = _enhancement.close();
     LanController.current?.detachPlayback(_lanIdentity);
