@@ -106,7 +106,7 @@ Flutter 多端独立短剧 / 影视应用，原名「短剧库 APP」。站源�
 
 ### GitHub Actions
 
-推送 `main` / `master`、`v*` 标签、提交 PR，或手动运行 **Build app packages**，会先检查再构建两版（默认与 `--all-sources`）：
+**Build app packages** 只能手动运行（Actions 页面的 Run workflow，或 `gh workflow run build.yml --ref <分支>`），推送分支、标签或提交 PR 都不会自动触发。运行时先检查再构建两版（默认与 `--all-sources`）：
 
 | 产物 | 内容 |
 | --- | --- |
@@ -114,7 +114,7 @@ Flutter 多端独立短剧 / 影视应用，原名「短剧库 APP」。站源�
 | `*-windows` | 完整 ZIP 和 SHA256 |
 | `*-ios-unsigned` | 未签名 `.app` ZIP 和 SHA256，不能直接当已签名 IPA 安装 |
 
-推送 `main` 且 android / ios / windows 全部构建成功时，自动创建 / 更新 GitHub Release（tag `app-v{version}`）。发布新版本前需先在 `pubspec.yaml` 提升 `version`，否则会覆盖同名 tag 的 Release。
+windows 与 ios 任务目前停用，只产出 android 包。android 构建成功后，无论运行在哪个分支，都会创建 / 更新 GitHub Release（tag `app-v{version}`）。发布新版本前需先在 `pubspec.yaml` 提升 `version`，否则会覆盖同名 tag 的 Release。
 
 Android 正式发布使用同一签名并递增构建号，在仓库 Secrets 配置：`ANDROID_KEYSTORE_BASE64`、`ANDROID_KEYSTORE_PASSWORD`、`ANDROID_KEY_ALIAS`、`ANDROID_KEY_PASSWORD`。未配置时生成 debug 签名预览包。
 
