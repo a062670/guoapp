@@ -39,6 +39,7 @@ class PlayerControls extends StatefulWidget {
     this.onRetryDanmaku,
     this.onPush,
     this.onPictureInPicture,
+    this.onSettings,
     this.enhancement,
   });
 
@@ -69,6 +70,7 @@ class PlayerControls extends StatefulWidget {
   final Future<void> Function()? onRetryDanmaku;
   final Future<void> Function()? onPush;
   final Future<void> Function()? onPictureInPicture;
+  final Future<void> Function()? onSettings;
   final VideoEnhancementController? enhancement;
 
   @override
@@ -760,6 +762,13 @@ class _PlayerControlsState extends State<PlayerControls> {
           ),
   );
 
+  Widget _settingsTool() => _toolIcon(
+    key: const ValueKey('player-settings'),
+    tooltip: '播放设置',
+    icon: Icons.tune_rounded,
+    onPressed: widget.enabled ? () => _panel(widget.onSettings!) : null,
+  );
+
   Widget _desktopControlRow({
     required bool fullscreen,
     required bool showEpisodes,
@@ -815,6 +824,7 @@ class _PlayerControlsState extends State<PlayerControls> {
               ? () => _panel(widget.onPictureInPicture!)
               : null,
         ),
+      if (widget.onSettings != null) _settingsTool(),
       _toolIcon(
         key: const ValueKey('player-fullscreen'),
         tooltip: fullscreen ? '退出全屏' : '旋转与全屏',
@@ -864,6 +874,7 @@ class _PlayerControlsState extends State<PlayerControls> {
               ? () => _panel(widget.onPictureInPicture!)
               : null,
         ),
+      if (widget.onSettings != null) _settingsTool(),
     ];
     return Padding(
       padding: const EdgeInsets.fromLTRB(2, 0, 2, 0),
