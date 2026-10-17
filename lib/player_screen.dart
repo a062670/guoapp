@@ -80,6 +80,8 @@ class _PlayerScreenState extends State<PlayerScreen>
   late final DanmakuController _danmaku;
   int _seekSequence = 0;
   bool _danmakuEnabled = true;
+  double _danmakuScale = 1;
+  double _danmakuOpacity = 1;
   late final PlayerInteractions _interactions;
   final _playerFocus = FocusNode(debugLabel: 'player-surface');
   final _videoPaneKey = GlobalKey();
@@ -153,6 +155,8 @@ class _PlayerScreenState extends State<PlayerScreen>
     quality: _requestedQuality,
     autoAdvance: _autoAdvance,
     danmaku: _danmakuEnabled,
+    danmakuScale: _danmakuScale,
+    danmakuOpacity: _danmakuOpacity,
     preload: _preloadEnabled,
     volume: _volume,
     enhancement: _enhancement.preferences,
@@ -181,6 +185,8 @@ class _PlayerScreenState extends State<PlayerScreen>
     _requestedQuality = preferences.quality;
     _autoAdvance = true;
     _danmakuEnabled = preferences.danmaku;
+    _danmakuScale = preferences.danmakuScale;
+    _danmakuOpacity = preferences.danmakuOpacity;
     _preloadEnabled = true;
     _loader = PlaybackLoader(widget.repository);
     _preloader = PlaybackPreloader(widget.repository);
@@ -1249,6 +1255,8 @@ class _PlayerScreenState extends State<PlayerScreen>
       _requestedQuality = nextPreferences.quality;
       _autoAdvance = true;
       _danmakuEnabled = nextPreferences.danmaku;
+      _danmakuScale = nextPreferences.danmakuScale;
+      _danmakuOpacity = nextPreferences.danmakuOpacity;
       _preloadEnabled = true;
     });
     _danmaku.setEnabled(_danmakuEnabled);
@@ -1750,7 +1758,12 @@ class _PlayerScreenState extends State<PlayerScreen>
       fit: StackFit.expand,
       children: [
         if (!hideOverlayForPictureInPicture)
-          DanmakuOverlay(controller: _danmaku, aspectRatio: _aspectRatio),
+          DanmakuOverlay(
+            controller: _danmaku,
+            aspectRatio: _aspectRatio,
+            scale: _danmakuScale,
+            opacity: _danmakuOpacity,
+          ),
         controls,
       ],
     );

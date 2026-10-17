@@ -288,6 +288,52 @@ class _PlayerMenuState extends State<PlayerMenu> {
               icon: const Icon(Icons.refresh_rounded),
               label: const Text('重试弹幕'),
             ),
+          if (preferences.danmaku) ...[
+            const SizedBox(height: 8),
+            const Text('弹幕大小'),
+            const SizedBox(height: 8),
+            Wrap(
+              spacing: 8,
+              runSpacing: 8,
+              children: [
+                for (final (scale, label) in danmakuScales)
+                  ChoiceChip(
+                    key: ValueKey('menu-danmaku-scale-$scale'),
+                    label: Text(label),
+                    selected: scale == preferences.danmakuScale,
+                    onSelected: _busy
+                        ? null
+                        : (_) => _run(
+                            () => widget.onPreferences(
+                              preferences.copyWith(danmakuScale: scale),
+                            ),
+                          ),
+                  ),
+              ],
+            ),
+            const SizedBox(height: 16),
+            const Text('弹幕透明度'),
+            const SizedBox(height: 8),
+            Wrap(
+              spacing: 8,
+              runSpacing: 8,
+              children: [
+                for (final opacity in danmakuOpacities)
+                  ChoiceChip(
+                    key: ValueKey('menu-danmaku-opacity-$opacity'),
+                    label: Text('${(opacity * 100).round()}%'),
+                    selected: opacity == preferences.danmakuOpacity,
+                    onSelected: _busy
+                        ? null
+                        : (_) => _run(
+                            () => widget.onPreferences(
+                              preferences.copyWith(danmakuOpacity: opacity),
+                            ),
+                          ),
+                  ),
+              ],
+            ),
+          ],
           const SizedBox(height: 8),
         ],
         if (all) ...[

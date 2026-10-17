@@ -6,6 +6,9 @@ const playbackSpeeds = [.5, .75, 1.0, 1.25, 1.5, 2.0, 3.0];
 const holdSpeeds = [1.5, 1.75, 2.0, 2.5, 3.0, 4.0, 5.0];
 const defaultHoldSpeed = 3.0;
 
+const danmakuScales = [(.75, '小'), (1.0, '标准'), (1.25, '大'), (1.5, '特大')];
+const danmakuOpacities = [.25, .5, .75, 1.0];
+
 class PlaybackPreferences {
   const PlaybackPreferences({
     this.speed = 1,
@@ -13,6 +16,8 @@ class PlaybackPreferences {
     this.quality = 0,
     this.autoAdvance = true,
     this.danmaku = true,
+    this.danmakuScale = 1,
+    this.danmakuOpacity = 1,
     this.preload = true,
     this.volume = 100,
     this.enhancement = const VideoEnhancementPreferences(),
@@ -23,6 +28,8 @@ class PlaybackPreferences {
   final int quality;
   final bool autoAdvance;
   final bool danmaku;
+  final double danmakuScale;
+  final double danmakuOpacity;
   final bool preload;
   final double volume;
   final VideoEnhancementPreferences enhancement;
@@ -33,6 +40,8 @@ class PlaybackPreferences {
     int? quality,
     bool? autoAdvance,
     bool? danmaku,
+    double? danmakuScale,
+    double? danmakuOpacity,
     bool? preload,
     double? volume,
     VideoEnhancementPreferences? enhancement,
@@ -42,6 +51,8 @@ class PlaybackPreferences {
     quality: quality ?? this.quality,
     autoAdvance: autoAdvance ?? this.autoAdvance,
     danmaku: danmaku ?? this.danmaku,
+    danmakuScale: danmakuScale ?? this.danmakuScale,
+    danmakuOpacity: danmakuOpacity ?? this.danmakuOpacity,
     preload: preload ?? this.preload,
     volume: volume ?? this.volume,
     enhancement: enhancement ?? this.enhancement,
@@ -53,6 +64,8 @@ class PlaybackPreferences {
     'quality': quality,
     'autoAdvance': autoAdvance,
     'danmaku': danmaku,
+    'danmakuScale': danmakuScale,
+    'danmakuOpacity': danmakuOpacity,
     'preload': preload,
     'volume': volume,
     'enhancement': enhancement.toJson(),
@@ -69,6 +82,15 @@ class PlaybackPreferences {
     final quality = value['quality'] as int? ?? 0;
     final autoAdvance = value['autoAdvance'] as bool? ?? true;
     final danmaku = value['danmaku'] as bool? ?? true;
+    final savedDanmakuScale = (value['danmakuScale'] as num?)?.toDouble();
+    final danmakuScale =
+        danmakuScales.any((scale) => scale.$1 == savedDanmakuScale)
+        ? savedDanmakuScale!
+        : 1.0;
+    final savedDanmakuOpacity = (value['danmakuOpacity'] as num?)?.toDouble();
+    final danmakuOpacity = danmakuOpacities.contains(savedDanmakuOpacity)
+        ? savedDanmakuOpacity!
+        : 1.0;
     final preload = value['preload'] as bool? ?? true;
     final savedVolume = (value['volume'] as num?)?.toDouble() ?? 100;
     final volume = savedVolume.isFinite
@@ -83,6 +105,8 @@ class PlaybackPreferences {
       quality: quality,
       autoAdvance: autoAdvance,
       danmaku: danmaku,
+      danmakuScale: danmakuScale,
+      danmakuOpacity: danmakuOpacity,
       preload: preload,
       volume: volume,
       enhancement: VideoEnhancementPreferences.fromJson(value['enhancement']),
