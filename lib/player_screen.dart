@@ -449,6 +449,7 @@ class _PlayerScreenState extends State<PlayerScreen>
   void _applyLifecycleVisibility({bool pauseWhenHidden = true}) {
     final visible =
         _lifecycleState == AppLifecycleState.resumed ||
+        (_lifecycleState == AppLifecycleState.inactive && Platform.isWindows) ||
         _pictureInPictureVisible;
     _foreground = visible;
     _enhancement.setForeground(_foreground);
@@ -1021,8 +1022,14 @@ class _PlayerScreenState extends State<PlayerScreen>
               await platform.setProperty('vd-lavc-skiploopfilter', 'all');
               await platform.setProperty('vd-lavc-skipidct', 'all');
               await platform.setProperty('vd-lavc-threads', '2');
-              await platform.setProperty('demuxer-max-bytes', '${4 * 1024 * 1024}');
-              await platform.setProperty('demuxer-max-back-bytes', '${1 * 1024 * 1024}');
+              await platform.setProperty(
+                'demuxer-max-bytes',
+                '${4 * 1024 * 1024}',
+              );
+              await platform.setProperty(
+                'demuxer-max-back-bytes',
+                '${1 * 1024 * 1024}',
+              );
               await platform.setProperty('demuxer-readahead-secs', '5');
             } else {
               await platform.setProperty('hwdec', 'auto-safe');
@@ -1780,7 +1787,8 @@ class _PlayerScreenState extends State<PlayerScreen>
                       crossAxisAlignment: WrapCrossAlignment.center,
                       children: [
                         FilledButton.tonalIcon(
-                          onPressed: () => DiaryService.showDiaryDialog(context),
+                          onPressed: () =>
+                              DiaryService.showDiaryDialog(context),
                           icon: const Icon(Icons.receipt_long_rounded),
                           label: const Text('查看播放日记'),
                         ),
@@ -1791,8 +1799,8 @@ class _PlayerScreenState extends State<PlayerScreen>
                             label: const Text('改为在线播放'),
                           )
                         else if (!_localFailure &&
-                              !widget.localOnly &&
-                              widget.repository.supportsSourceManagement)
+                            !widget.localOnly &&
+                            widget.repository.supportsSourceManagement)
                           SourceDiagnosticsButton(
                             repository: widget.repository,
                             store: widget.store,
