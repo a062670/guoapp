@@ -196,6 +196,9 @@ func (host *drpyHost) fetch(target string, options map[string]any) (drpyResponse
 	if err != nil {
 		return drpyResponse{}, err
 	}
+	if err := drpyCheckTarget(host.ctx, request.URL); err != nil {
+		return drpyResponse{}, err
+	}
 	request.Header.Set("User-Agent", drpyMobileUA)
 	if contentType != "" {
 		request.Header.Set("Content-Type", contentType)
@@ -214,7 +217,7 @@ func (host *drpyHost) fetch(target string, options map[string]any) (drpyResponse
 		}
 		defer release()
 	}
-	response, err := host.downloader.client.Do(request)
+	response, err := drpyGuardedClient(host.ctx, host.downloader.client).Do(request)
 	if err != nil {
 		return drpyResponse{}, err
 	}
