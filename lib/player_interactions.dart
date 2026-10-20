@@ -14,10 +14,7 @@ import 'widgets.dart';
 enum SwipeAction { none, brightness, episode, progress }
 
 class GestureHudState {
-  const GestureHudState({
-    this.type = SwipeAction.none,
-    this.value = 0.0,
-  });
+  const GestureHudState({this.type = SwipeAction.none, this.value = 0.0});
   final SwipeAction type;
   final double value; // 0.0 ~ 1.0
 }
@@ -36,12 +33,14 @@ class PlayerInteractions extends ChangeNotifier {
     _playing = player.stream.playing.listen((playing) {
       if (!playing) cancel();
     });
-    AppDevice.getBrightness().then((val) {
-      if (!_disposed) {
-        _brightness = val;
-        notifyListeners();
-      }
-    }).catchError((_) {});
+    AppDevice.getBrightness()
+        .then((val) {
+          if (!_disposed) {
+            _brightness = val;
+            notifyListeners();
+          }
+        })
+        .catchError((_) {});
   }
 
   final Player player;
@@ -79,6 +78,14 @@ class PlayerInteractions extends ChangeNotifier {
   GestureHudState _hudState = const GestureHudState();
   double _brightness = 0.5;
   double _initialBrightness = 0.5;
+
+  /// 亮度手势是否已确认（垂直拖动超过阈值）。
+  /// 按下只算「候选区域」，未确认前不改亮度、不显示 HUD——
+  /// 否则左半屏长按倍速 / 双击暂停都会先闪一个亮度图标。
+  bool _brightnessLatched = false;
+
+  /// latch 时刻的 y 坐标，作为亮度增量基准（避免从阈值点开始跳变）。
+  double _brightnessAnchorDy = 0;
   double _viewWidth = 0.0;
   double _viewHeight = 0.0;
   int _seekSeconds = 0;
@@ -88,8 +95,9 @@ class PlayerInteractions extends ChangeNotifier {
   static const double _kProgressFullWidthSeconds = 90;
 
   /// 把水平拖动像素换算成秒（正=快进，负=后退）。
-  int _progressSeconds(double dx) =>
-      _viewWidth <= 0 ? 0 : (dx / _viewWidth * _kProgressFullWidthSeconds).round();
+  int _progressSeconds(double dx) => _viewWidth <= 0
+      ? 0
+      : (dx / _viewWidth * _kProgressFullWidthSeconds).round();
 
   /// 拖动过程中的实时目标位置提示（与 seek() 的提示文案保持一致）。
   String _seekHint(int seconds) {
@@ -120,6 +128,7 @@ class PlayerInteractions extends ChangeNotifier {
   void dismissBrightnessHud() {
     _scheduleDismissHud();
   }
+
   String get feedback => _feedback;
   bool get boosting => _boosting;
 
@@ -129,8 +138,7 @@ class PlayerInteractions extends ChangeNotifier {
   bool get suppressTap => DateTime.now().isBefore(_ignoreTapUntil);
   Future<void> get pendingRates => _rates;
 
-  String get _boostLabel =>
-      '${_speedText(holdSpeed())} 倍速 · 松开恢复';
+  String get _boostLabel => '${_speedText(holdSpeed())} 倍速 · 松开恢复';
 
   static String _speedText(double value) =>
       value == value.roundToDouble() ? value.toInt().toString() : '$value';
@@ -246,15 +254,19 @@ class PlayerInteractions extends ChangeNotifier {
 
     if (_swipeEnabled && width > 0) {
       // 判定触摸落点：
-      // 左侧 35% 区域 -> 呼出并拉动红果风格亮度条
+      // 左侧 35% 区域 -> 竖向：红果风格亮度条；横向：进度调整
       // 右侧 65% 区域 -> 水平拖动调整进度，垂直滑动刷剧切集，绝对不调节音量
       // （水平/垂直在 pointerMove 里按主方向 latch，二者互斥）
       if (event.localPosition.dx < width * 0.35) {
+        // 只是「候选」亮度区，**不在这里弹 HUD**：
+        // 左半屏长按（倍速）与双击（暂停）在按下瞬间就命中此处，
+        // 旧实现直接 _showHud，导致这两个操作先闪一个亮度图标。
+        // 真正确认是垂直拖动后，才在 pointerMove 里 latch 并显示。
         _swipeAction = SwipeAction.brightness;
+        _brightnessLatched = false;
         AppDevice.getBrightness().then((val) {
           if (_pointer == event.pointer) {
             _initialBrightness = _brightness = val;
-            _showHud(SwipeAction.brightness, _brightness);
           }
         });
       } else {
@@ -268,17 +280,46 @@ class PlayerInteractions extends ChangeNotifier {
     if (_pointer != event.pointer || _origin == null) return;
     _lastPosition = event.localPosition;
     final diff = event.localPosition - _origin!;
-    if (diff.distance > 12) {
+    // 用 _swipeThreshold（屏高 8%，30~80px）而不是固定 12px：
+    // 长按倍速时手指几乎不可能完全静止，12px 的抖动就会 _endHold 取消倍速，
+    // 表现为「长按没反应」。真正开始滑动（超过阈值）再取消 boost 才符合预期。
+    if (diff.distance > _swipeThreshold) {
       _moved = true;
       _endHold();
     }
-    if (!_swipeEnabled || !_moved || _viewHeight <= 0 || _viewWidth <= 0) return;
-
-    final dy = _origin!.dy - event.localPosition.dy; // 向上滑动为增加，向下滑动为减少
-    final deltaRatio = dy / (_viewHeight * 0.6);
+    if (!_swipeEnabled || !_moved || _viewHeight <= 0 || _viewWidth <= 0)
+      return;
 
     if (_swipeAction == SwipeAction.brightness) {
-      _brightness = (_initialBrightness + deltaRatio).clamp(0.01, 1.0);
+      // 亮度的 latch 条件：垂直位移超过阈值，且明显大于水平位移。
+      // 未 latch 前（长按不动 / 双击 / 斜向微动）不改变亮度也不显示 HUD。
+      if (!_brightnessLatched) {
+        // 左半屏横向拖动：改判为进度调整。加进度入口后左半屏同时承载
+        // 「竖向调亮度 / 横向调进度」，与右半屏的进度手势保持一致。
+        final horizontal =
+            diff.dx.abs() > _swipeThreshold && diff.dx.abs() > diff.dy.abs();
+        if (horizontal) {
+          _swipeAction = SwipeAction.progress;
+          _seekSeconds = _progressSeconds(diff.dx);
+          final preview = _seekHint(_seekSeconds);
+          if (preview.isNotEmpty) {
+            _progressPreviewing = true;
+            hint(preview, persistent: true);
+          }
+          return;
+        }
+        final vertical =
+            diff.dy.abs() > _swipeThreshold && diff.dy.abs() > diff.dx.abs();
+        if (!vertical) return;
+        _brightnessLatched = true;
+        // 以 latch 时刻的位置为基准，避免从阈值点开始出现亮度跳变。
+        _brightnessAnchorDy = event.localPosition.dy;
+        _showHud(SwipeAction.brightness, _brightness);
+        return;
+      }
+      final ratio =
+          (_brightnessAnchorDy - event.localPosition.dy) / (_viewHeight * 0.6);
+      _brightness = (_initialBrightness + ratio).clamp(0.01, 1.0);
       AppDevice.setBrightness(_brightness);
       _showHud(SwipeAction.brightness, _brightness);
     } else if (_swipeAction == SwipeAction.episode ||
@@ -312,11 +353,13 @@ class PlayerInteractions extends ChangeNotifier {
     }
     if (_pointer != event.pointer || _origin == null) return;
     final delta = (_lastPosition ?? event.localPosition) - _origin!;
-    final isVertical = delta.dy.abs() >= _swipeThreshold && delta.dy.abs() > delta.dx.abs() * 1.5;
+    final isVertical =
+        delta.dy.abs() >= _swipeThreshold &&
+        delta.dy.abs() > delta.dx.abs() * 1.5;
 
     if (_swipeAction == SwipeAction.progress && _swipeEnabled && _moved) {
-      // 右半屏水平拖动提交：seek() 自带 available/duration 校验与 clamp，
-      // 并发出与双击快进一致的最终提示（自动清除拖动期的常驻预览）。
+      // 横向拖动提交（左右半屏一致）：seek() 自带 available/duration 校验与
+      // clamp，并发出与双击快进一致的最终提示（自动清除拖动期的常驻预览）。
       // 提交即结束进程态，解除 chrome 抑制，最终提示按普通提示处理。
       _progressPreviewing = false;
       if (_seekSeconds != 0) seek(_seekSeconds);
@@ -327,7 +370,7 @@ class PlayerInteractions extends ChangeNotifier {
         isVertical &&
         event.timeStamp - _started < const Duration(milliseconds: 1500)) {
       if (available()) hint(onEpisode(delta.dy < 0 ? 1 : -1));
-    } else if (_swipeAction == SwipeAction.brightness) {
+    } else if (_swipeAction == SwipeAction.brightness && _brightnessLatched) {
       _scheduleDismissHud();
     }
 

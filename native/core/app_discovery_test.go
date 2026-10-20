@@ -138,4 +138,12 @@ func TestNativeCoverMetadataRejectsOtherDramaAndKeepsCurrentHost(t *testing.T) {
 	if got := nativeCoverReferer(d, sourceHuangdou, "https://new-cover.example.test/synthetic.img"); got != "https://mirror.example.test/home" {
 		t.Fatal("cover referer ignored active source mirror", got)
 	}
+	// drpy 脚本源海报用脚本 host 作 Referer。
+	d.drpy = loadDrpyStore(t.TempDir())
+	if _, err := d.drpy.put(drpySite{Key: "demo", Name: "演示", Host: "img.test"}); err != nil {
+		t.Fatal(err)
+	}
+	if got := nativeCoverReferer(d, drpySourceID("demo"), "https://img.test/pic.jpg"); got != "https://img.test/" {
+		t.Fatalf("drpy 封面 referer 异常: %q", got)
+	}
 }

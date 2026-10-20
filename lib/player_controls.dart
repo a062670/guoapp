@@ -1,9 +1,10 @@
 import 'dart:async';
+import 'dart:io';
 
+import 'package:battery_plus/battery_plus.dart';
 import 'package:flutter/material.dart';
 import 'package:media_kit/media_kit.dart';
 
-import 'app_layout.dart';
 import 'lan_controller.dart';
 import 'player_interactions.dart';
 import 'widgets.dart';
@@ -81,6 +82,11 @@ class _PlayerControlsState extends State<PlayerControls> {
   final List<StreamSubscription<dynamic>> _subscriptions = [];
   Timer? _hideTimer;
   Timer? _cursorTimer;
+  Timer? _clockTimer;
+  DateTime _now = DateTime.now();
+  final Battery _battery = Battery();
+  int? _batteryLevel;
+  bool _batteryCharging = false;
   bool _visible = true;
   bool _cursorVisible = false;
   bool _suppressAutoPlaybackStart = false;
@@ -126,6 +132,37 @@ class _PlayerControlsState extends State<PlayerControls> {
     );
     widget.interactions.addListener(_interactionChanged);
     _scheduleHide();
+    // 顶部栏的时钟与电量：只在移动端（Android/TV）读电量，桌面端没有意义。
+    _clockTimer = Timer.periodic(const Duration(seconds: 30), (_) {
+      if (mounted) setState(() => _now = DateTime.now());
+    });
+    if (Platform.isAndroid) {
+      unawaited(_refreshBattery());
+      _subscriptions.add(
+        _battery.onBatteryStateChanged.listen((state) {
+          if (!mounted) return;
+          setState(() {
+            _batteryCharging =
+                state == BatteryState.charging || state == BatteryState.full;
+          });
+          unawaited(_refreshBattery());
+        }),
+      );
+    }
+  }
+
+  /// 读取电量百分比与充电状态。失败（模拟器/无电池设备）时静默不显示。
+  Future<void> _refreshBattery() async {
+    try {
+      final level = await _battery.batteryLevel;
+      final state = await _battery.batteryState;
+      if (!mounted) return;
+      setState(() {
+        _batteryLevel = level;
+        _batteryCharging =
+            state == BatteryState.charging || state == BatteryState.full;
+      });
+    } catch (_) {}
   }
 
   @override
@@ -192,6 +229,11 @@ class _PlayerControlsState extends State<PlayerControls> {
   void _show() {
     if (!mounted) return;
     if (!_visible) setState(() => _visible = true);
+    // 控件重新出现时刷新时间与电量，避免显示上一次的旧值。
+    if (_now.minute != DateTime.now().minute) {
+      setState(() => _now = DateTime.now());
+    }
+    if (Platform.isAndroid) unawaited(_refreshBattery());
     _scheduleHide();
   }
 
@@ -222,6 +264,7 @@ class _PlayerControlsState extends State<PlayerControls> {
   void dispose() {
     _hideTimer?.cancel();
     _cursorTimer?.cancel();
+    _clockTimer?.cancel();
     widget.interactions.removeListener(_interactionChanged);
     for (final subscription in _subscriptions) {
       subscription.cancel();
@@ -310,24 +353,35 @@ class _PlayerControlsState extends State<PlayerControls> {
                           8,
                           _bottomChromeInset(),
                         ),
-                        child: Stack(
-                          children: [
-                            if (widget.fullscreen || widget.swipeEnabled)
-                              _topBar(),
-                            if (!state.buffering &&
-                                widget.enabled &&
-                                constraints.maxHeight >=
-                                    (widget.swipeEnabled ? 168 : 220))
-                              _centerPlayback(state.playing, showSkip: true),
-                            _sideDanmakuControl(),
-                            _bottomControls(
-                              constraints: constraints,
-                              volume: state.volume,
-                              duration: duration,
-                              position: position,
-                              buffered: buffered,
+                        // 控件层永远叠在深色渐变上：统一白色前景，避免浅色主题下
+                        // 继承黑色文字/图标而看不清（顶部栏时钟电量、提示文字等）。
+                        child: DefaultTextStyle.merge(
+                          style: const TextStyle(color: Colors.white),
+                          child: IconTheme.merge(
+                            data: const IconThemeData(color: Colors.white),
+                            child: Stack(
+                              children: [
+                                if (widget.fullscreen || widget.swipeEnabled)
+                                  _topBar(),
+                                if (!state.buffering &&
+                                    widget.enabled &&
+                                    constraints.maxHeight >=
+                                        (widget.swipeEnabled ? 168 : 220))
+                                  _centerPlayback(
+                                    state.playing,
+                                    showSkip: true,
+                                  ),
+                                _sideDanmakuControl(),
+                                _bottomControls(
+                                  constraints: constraints,
+                                  volume: state.volume,
+                                  duration: duration,
+                                  position: position,
+                                  buffered: buffered,
+                                ),
+                              ],
                             ),
-                          ],
+                          ),
                         ),
                       ),
                     ],
@@ -369,6 +423,7 @@ class _PlayerControlsState extends State<PlayerControls> {
               )
             else
               const Spacer(),
+            _statusCluster(),
             if (compact)
               _overlayIconButton(
                 tooltip: '旋转与全屏',
@@ -379,6 +434,57 @@ class _PlayerControlsState extends State<PlayerControls> {
         ),
       ),
     );
+  }
+
+  /// 顶部栏右侧的时钟与电量。
+  Widget _statusCluster() {
+    final hour = _now.hour.toString().padLeft(2, '0');
+    final minute = _now.minute.toString().padLeft(2, '0');
+    final level = _batteryLevel;
+    return Padding(
+      padding: const EdgeInsets.symmetric(horizontal: 6),
+      child: DecoratedBox(
+        decoration: BoxDecoration(
+          color: Colors.black.withValues(alpha: .36),
+          borderRadius: BorderRadius.circular(22),
+        ),
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+          child: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Text(
+                '$hour:$minute',
+                style: const TextStyle(
+                  color: Colors.white,
+                  fontSize: 13,
+                  height: 1,
+                ),
+              ),
+              if (level != null) ...[
+                const SizedBox(width: 6),
+                Icon(_batteryIcon(level), size: 16),
+                const SizedBox(width: 2),
+                Text(
+                  '$level%',
+                  style: const TextStyle(
+                    color: Colors.white,
+                    fontSize: 12,
+                    height: 1,
+                  ),
+                ),
+              ],
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  IconData _batteryIcon(int level) {
+    if (_batteryCharging) return Icons.battery_charging_full_rounded;
+    if (level <= 10) return Icons.battery_alert_rounded;
+    return Icons.battery_full_rounded;
   }
 
   Widget _overlayIconButton({
@@ -1109,6 +1215,8 @@ class _PlayerControlsState extends State<PlayerControls> {
               feedback,
               textAlign: TextAlign.center,
               style: TextStyle(
+                // 提示层叠在深色半透明底上，显式白字避免浅色主题下变灰看不清。
+                color: Colors.white,
                 fontSize: compact ? 12.5 : 14,
                 fontWeight: compact ? FontWeight.w600 : FontWeight.w500,
               ),

@@ -84,12 +84,16 @@ func signHongguoRequest(request *http.Request, body []byte, now time.Time) {
 	request.Header.Set("X-Gorgon", hex.EncodeToString(signature))
 	request.Header.Set("X-Khronos", strconv.FormatUint(uint64(timestamp), 10))
 
-	// 最小签名集的另两头：同一时间戳的两种字节序 base64（缺任一头即被服务端判空）。
+	// 最小签名集另两头：同一时间戳的 base64 两种字节序（小端 / 大端各一份）。
+	//
+	// 服务端校验升级后，携带签名的请求必须四头齐送（Gorgon / Khronos /
+	// Argus / Ladon），缺任一头都会拿到 200 空 body——接口看似成功、
+	// 实际取不到播放地址，表现为无法播放。四头齐送即可，服务端不校验
+	// 其他签名头。
 	var stamp [4]byte
 	binary.LittleEndian.PutUint32(stamp[:], timestamp)
 	request.Header.Set("X-Argus", base64.StdEncoding.EncodeToString(stamp[:]))
 	binary.BigEndian.PutUint32(stamp[:], timestamp)
 	request.Header.Set("X-Ladon", base64.StdEncoding.EncodeToString(stamp[:]))
-
 	request.Header.Set("X-SS-Req-Ticket", strconv.FormatInt(now.UnixMilli(), 10))
 }

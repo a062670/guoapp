@@ -1,12 +1,28 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 
+import 'core_bridge.dart';
 import 'lan_screen.dart';
 import 'local_store.dart';
 import 'webdav_sync.dart';
 
 class WebDavSyncScreen extends StatefulWidget {
-  const WebDavSyncScreen({super.key, required this.store});
+  const WebDavSyncScreen({
+    super.key,
+    required this.store,
+    required this.repository,
+    this.syncOnOpen = false,
+  });
   final LocalStore store;
+
+  /// 片源仓库：同步片源订阅（对端导入的 LibreTV / drpy 源）与自动导入用。
+  final AppRepository repository;
+
+  /// 进入页面后立即同步一次。追剧页右上角入口用它，省掉"跳转后再点一次"。
+  /// 注意与 WebDavSettings.autoSync（后台自动同步开关）区分：这里只是一次性
+  /// 触发，不改变任何设置。
+  final bool syncOnOpen;
 
   @override
   State<WebDavSyncScreen> createState() => _WebDavSyncScreenState();
@@ -31,6 +47,21 @@ class _WebDavSyncScreenState extends State<WebDavSyncScreen> {
   bool _busy = false;
   String _message = '';
   WebDavSyncOutcome? _outcome;
+
+  /// 上次同步的非致命警告（个别片源导入失败等），逐条展示。
+  List<String> _warnings = const [];
+
+  @override
+  void initState() {
+    super.initState();
+    if (!widget.syncOnOpen) return;
+    if (widget.store.webDavSettings.configured) {
+      unawaited(_sync());
+    } else {
+      // 没配置就不发无意义的请求，直接提示填配置。
+      _message = '尚未配置 WebDAV，填写并保存后即可同步';
+    }
+  }
 
   bool get _dirty =>
       _form.enabled != _saved.enabled ||
@@ -125,6 +156,7 @@ class _WebDavSyncScreenState extends State<WebDavSyncScreen> {
       _busy = true;
       _message = '';
       _outcome = null;
+      _warnings = const [];
     });
     final settings = widget.store.webDavSettings;
     final transport = HttpWebDavTransport(
@@ -135,13 +167,22 @@ class _WebDavSyncScreenState extends State<WebDavSyncScreen> {
       final outcome = await WebDavSynchronizer(
         store: widget.store,
         transport: transport,
+        repository: widget.repository,
       ).synchronize();
       if (!mounted) return;
       setState(() {
         _outcome = outcome;
         _saved = widget.store.webDavSettings;
         _form = _saved;
-        _message = outcome.hasChanges ? '同步完成' : '已是最新，没有变化';
+        final summary = outcome.hasChanges ? '同步完成' : '已是最新，没有变化';
+        final extra = <String>[
+          if (outcome.sourcePrefs > 0) '片源偏好 ${outcome.sourcePrefs} 项',
+          if (outcome.sourceImports > 0) '导入片源 ${outcome.sourceImports} 个',
+        ];
+        _message = extra.isEmpty
+            ? summary
+            : '$summary（${extra.join('，')}）';
+        _warnings = outcome.warnings;
       });
     } catch (failure) {
       if (mounted) setState(() => _message = failure.toString());
@@ -190,6 +231,14 @@ class _WebDavSyncScreenState extends State<WebDavSyncScreen> {
                             '账号密码只保存在本机，不明文显示，不进入导出备份。',
                           ),
                         ),
+                        const Padding(
+                          padding: EdgeInsets.only(top: 8),
+                          child: Text(
+                            '同步范围还包括片源：已导入的 LibreTV / drpy 片源会出现在其他设备上'
+                            '（自动导入），收藏 / 隐藏状态按最新操作时间合并。'
+                            '注意：粘贴导入的 drpy 脚本源没有可同步的地址，不会跨设备传输。',
+                          ),
+                        ),
                       ],
                     ),
                   ),
@@ -221,17 +270,23 @@ class _WebDavSyncScreenState extends State<WebDavSyncScreen> {
                         '填到服务提供的 WebDAV 目录为止，坚果云要在域名后带上 /dav/，Nextcloud 通常形如 /remote.php/dav/files/用户名/',
                   ),
                 ),
+                const SizedBox(height: 12),
                 TextField(
                   controller: _username,
                   enabled: !_busy,
-                  decoration: const InputDecoration(labelText: '账号'),
+                  decoration: const InputDecoration(
+                    labelText: '账号',
+                    isDense: true,
+                  ),
                 ),
+                const SizedBox(height: 12),
                 TextField(
                   controller: _password,
                   enabled: !_busy,
                   obscureText: _obscure,
                   decoration: InputDecoration(
                     labelText: '密码',
+                    isDense: true,
                     suffixIcon: IconButton(
                       icon: Icon(
                         _obscure
@@ -243,6 +298,7 @@ class _WebDavSyncScreenState extends State<WebDavSyncScreen> {
                     ),
                   ),
                 ),
+                const SizedBox(height: 12),
                 TextField(
                   controller: _directory,
                   enabled: !_busy,
@@ -302,9 +358,31 @@ class _WebDavSyncScreenState extends State<WebDavSyncScreen> {
                     padding: const EdgeInsets.only(top: 12),
                     child: SelectableText(_message),
                   ),
+                for (final warning in _warnings)
+                  Padding(
+                    padding: const EdgeInsets.only(top: 4),
+                    child: SelectableText(
+                      warning,
+                      style: TextStyle(
+                        color: Theme.of(context).colorScheme.error,
+                      ),
+                    ),
+                  ),
                 if (_busy) const Padding(
                   padding: EdgeInsets.only(top: 12),
                   child: LinearProgressIndicator(),
+                ),
+                // 追剧页右上角的同步按钮已改为直达本页，这里补一个反向入口，
+                // 免得局域网同步只能从「设置」里绕进去。
+                Card(
+                  key: const ValueKey('webdav-open-lan'),
+                  child: ListTile(
+                    leading: const Icon(Icons.devices_rounded),
+                    title: const Text('设备互联'),
+                    subtitle: const Text('局域网自动同步追剧与推送播放'),
+                    trailing: const Icon(Icons.chevron_right_rounded),
+                    onTap: () => openLanSync(context),
+                  ),
                 ),
                 if (conflicts > 0)
                   Card(

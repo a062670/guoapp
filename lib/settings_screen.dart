@@ -156,12 +156,15 @@ class _SettingsScreenState extends State<SettingsScreen> {
                 key: const ValueKey('webdav-settings'),
                 leading: const Icon(Icons.cloud_sync_outlined),
                 title: const Text('WebDAV 同步'),
-                subtitle: const Text('通过 WebDAV 网盘在多设备间同步追剧与观看记录'),
+                subtitle: const Text('通过 WebDAV 网盘在多设备间同步追剧、观看记录、片源与收藏状态'),
                 trailing: const Icon(Icons.chevron_right_rounded),
                 onTap: () => Navigator.push(
                   context,
                   MaterialPageRoute<void>(
-                    builder: (_) => WebDavSyncScreen(store: widget.store),
+                    builder: (_) => WebDavSyncScreen(
+                      store: widget.store,
+                      repository: widget.repository,
+                    ),
                   ),
                 ),
               ),

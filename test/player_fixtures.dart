@@ -137,6 +137,7 @@ class RouteRepository extends FixtureRepository {
     Drama drama,
     Episode episode, {
     int quality = 0,
+    int route = 0,
   }) async {
     primaryCalls++;
     requestedQualities.add(quality);

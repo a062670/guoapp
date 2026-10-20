@@ -93,6 +93,7 @@ class DownloadRepository extends FixtureRepository {
     Drama drama,
     Episode episode, {
     int quality = 0,
+    int route = 0,
   }) async {
     final plan = await localPlayback(drama, episode);
     if (plan == null) throw AppFailure('本地文件缺失', code: 'local_media');

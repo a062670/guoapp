@@ -14,6 +14,7 @@ class PlaybackLoader {
     int quality = 0,
     bool localOnly = false,
     bool online = false,
+    int route = 0,
   }) => _load(() async {
     if (online) {
       return repository.resolveOnline(drama, episode, quality: quality);
@@ -25,7 +26,7 @@ class PlaybackLoader {
       }
       return plan;
     }
-    return repository.resolve(drama, episode, quality: quality);
+    return repository.resolve(drama, episode, quality: quality, route: route);
   });
 
   Future<PlaybackPlan?> fallback(PlaybackPlan current) =>

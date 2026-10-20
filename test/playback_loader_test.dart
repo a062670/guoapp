@@ -18,6 +18,7 @@ class DeferredRepository extends FixtureRepository {
     Drama drama,
     Episode episode, {
     int quality = 0,
+    int route = 0,
   }) {
     final request = Completer<PlaybackPlan>();
     pending[episode.number] = request;

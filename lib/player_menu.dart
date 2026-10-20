@@ -5,11 +5,22 @@ import 'package:flutter/material.dart';
 import 'models.dart';
 import 'episode_browser.dart';
 import 'playback_preferences.dart';
+import 'resolution_meter.dart';
 import 'video_enhancement.dart';
 import 'video_enhancement_settings.dart';
 import 'diary_service.dart';
 
 enum PlayerMenuSection { episodes, speed, quality, settings }
+
+/// 播放线路选项：LibreTV 等片源的同一集可能来自多个播放源，
+/// 在详情里表现为「第N集」「第N集·源名」的并列章节。
+class PlayerLine {
+  const PlayerLine({required this.index, required this.label});
+
+  /// 在 episodes 列表里的下标（切换线路 = 切到该章节）。
+  final int index;
+  final String label;
+}
 
 class PlayerMenu extends StatefulWidget {
   const PlayerMenu({
@@ -26,6 +37,9 @@ class PlayerMenu extends StatefulWidget {
     required this.onEpisode,
     required this.onPreferences,
     required this.onFavorite,
+    this.videoWidth = 0,
+    this.videoHeight = 0,
+    this.lines = const [],
     this.showDanmaku = false,
     this.danmakuStatus = '',
     this.onRetryDanmaku,
@@ -40,9 +54,16 @@ class PlayerMenu extends StatefulWidget {
   final PlaybackPreferences preferences;
   final List<int> qualities;
   final int actualQuality;
+
+  /// 自动检测到的片源像素宽/高（0 = 尚未检测到）。
+  final int videoWidth;
+  final int videoHeight;
   final bool local;
   final bool favorite;
   final bool mobile;
+
+  /// 同集的可选线路（含当前线路）；空表示该源没有多线路信息。
+  final List<PlayerLine> lines;
   final bool showDanmaku;
   final String danmakuStatus;
   final VoidCallback? onRetryDanmaku;
@@ -81,10 +102,14 @@ class _PlayerMenuState extends State<PlayerMenu> {
     final size = MediaQuery.sizeOf(context);
     final landscape = size.width > size.height;
     final colors = Theme.of(context).colorScheme;
+    final hasQualities = widget.qualities.any((quality) => quality > 0);
+    final hasLines = widget.lines.length > 1;
     final title = switch (widget.section) {
       PlayerMenuSection.episodes => '选集 · 共 ${widget.episodes.length} 集',
       PlayerMenuSection.speed => '播放倍速',
-      PlayerMenuSection.quality => '清晰度',
+      // 没有真实清晰度档位（如 LibreTV 采集源）时，这个入口实际提供的是线路选择。
+      PlayerMenuSection.quality =>
+        hasLines ? (hasQualities ? '清晰度 / 线路' : '线路') : '清晰度',
       PlayerMenuSection.settings => '播放设置',
     };
     return Dialog(
@@ -159,6 +184,7 @@ class _PlayerMenuState extends State<PlayerMenu> {
       0,
       ...widget.qualities.where((quality) => quality > 0),
     }.toList();
+    final hasQualities = widget.qualities.any((quality) => quality > 0);
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
@@ -214,45 +240,90 @@ class _PlayerMenuState extends State<PlayerMenu> {
           const SizedBox(height: 20),
         ],
         if (all || widget.section == PlayerMenuSection.quality) ...[
-          const Text('清晰度'),
+          // 片源清晰度自动检测：进度条 + 节点（480P/1080P/2K/4K），
+          // 按播放器上报的真实像素尺寸填充进度，本地/在线片源一视同仁。
+          const Text('片源清晰度（自动检测）'),
           const SizedBox(height: 8),
-          Text(
-            widget.local
-                ? '本集正在播放本地原画，画质偏好用于后续在线播放。'
-                : widget.actualQuality > 0
-                ? '当前播放 ${widget.actualQuality}P'
-                : '使用源站可用画质',
-            style: helperStyle,
+          ResolutionMeter(
+            width: widget.videoWidth,
+            height: widget.videoHeight,
           ),
-          const SizedBox(height: 8),
-          Wrap(
-            spacing: 8,
-            runSpacing: 8,
-            children: [
-              for (final quality in qualities)
-                ChoiceChip(
-                  key: ValueKey('menu-quality-$quality'),
-                  label: Text(quality == 0 ? '自动（优先高清）' : '${quality}P'),
-                  selected: quality == preferences.quality,
-                  onSelected: _busy
-                      ? null
-                      : (_) => _run(
-                          () => widget.onPreferences(
-                            preferences.copyWith(quality: quality),
-                          ),
-                        ),
-                ),
-            ],
-          ),
-          if (!qualities.contains(preferences.quality))
-            Padding(
-              padding: const EdgeInsets.only(top: 8),
-              child: Text(
-                '已保存 ${preferences.quality}P 偏好，本集暂无此画质。',
-                style: helperStyle,
-              ),
-            ),
           const SizedBox(height: 20),
+          // 线路：同一集来自多个播放源时可手动切换，避免只能靠自动回退。
+          if (widget.lines.length > 1) ...[
+            const Text('线路'),
+            const SizedBox(height: 4),
+            Text('同一集的其他播放源，切换后从该源重新取流；当前线路不可用时也会自动回退。', style: helperStyle),
+            const SizedBox(height: 8),
+            Wrap(
+              spacing: 8,
+              runSpacing: 8,
+              children: [
+                for (final line in widget.lines)
+                  ChoiceChip(
+                    key: ValueKey('menu-line-${line.index}'),
+                    label: Text(line.label),
+                    selected: line.index == widget.currentIndex,
+                    onSelected: _busy
+                        ? null
+                        : (_) => widget.onEpisode(line.index),
+                  ),
+              ],
+            ),
+            const SizedBox(height: 20),
+          ],
+          // 没有真实清晰度档位的源（如 LibreTV 采集站）不再显示只有一个
+          // 「自动」选项的空区块，避免用户看到「清晰度是空的」。
+          if (hasQualities) ...[
+            const Text('清晰度'),
+            const SizedBox(height: 8),
+            Text(
+              widget.local
+                  ? '本集正在播放本地原画，画质偏好用于后续在线播放。'
+                  : widget.actualQuality > 0
+                  ? '当前播放 ${widget.actualQuality}P'
+                  : '使用源站可用画质',
+              style: helperStyle,
+            ),
+            const SizedBox(height: 8),
+            Wrap(
+              spacing: 8,
+              runSpacing: 8,
+              children: [
+                for (final quality in qualities)
+                  ChoiceChip(
+                    key: ValueKey('menu-quality-$quality'),
+                    label: Text(quality == 0 ? '自动（优先高清）' : '${quality}P'),
+                    selected: quality == preferences.quality,
+                    onSelected: _busy
+                        ? null
+                        : (_) => _run(
+                            () => widget.onPreferences(
+                              preferences.copyWith(quality: quality),
+                            ),
+                          ),
+                  ),
+              ],
+            ),
+            if (!qualities.contains(preferences.quality))
+              Padding(
+                padding: const EdgeInsets.only(top: 8),
+                child: Text(
+                  '已保存 ${preferences.quality}P 偏好，本集暂无此画质。',
+                  style: helperStyle,
+                ),
+              ),
+            const SizedBox(height: 20),
+          ],
+          // 既没有画质档位也没有多线路（单线路采集源）：给一句解释，
+          // 不留一个空白面板。
+          if (!hasQualities && widget.lines.length <= 1)
+            Text(
+              widget.local
+                  ? '本集正在播放本地原画，没有可切换的网络清晰度。'
+                  : '当前片源没有可选的清晰度或线路，由站源自动选择播放地址。',
+              style: helperStyle,
+            ),
         ],
         if ((all || widget.section == PlayerMenuSection.quality) &&
             widget.enhancement != null)

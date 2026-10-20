@@ -58,6 +58,41 @@ void main() {
     return store;
   }
 
+  test('drama score, cast and director survive the json round trip', () {
+    const rated = Drama(
+      id: 'hongguo:rated',
+      source: 'hongguo',
+      title: '评分剧',
+      score: '8.6',
+      actor: '张三,李四',
+      director: '王五',
+    );
+    final restored = Drama.fromJson(
+      jsonDecode(jsonEncode(rated.toJson())) as Map<String, dynamic>,
+    );
+    expect(restored.score, '8.6');
+    expect(restored.actor, '张三,李四');
+    expect(restored.director, '王五');
+
+    // 旧备份里没有这三个键，必须回落为空串而不是抛异常。
+    final legacy = Drama.fromJson(const {
+      'id': 'hongguo:legacy',
+      'source': 'hongguo',
+      'title': '旧备份',
+    });
+    expect(legacy.score, isEmpty);
+    expect(legacy.actor, isEmpty);
+    expect(legacy.director, isEmpty);
+
+    // 新数据缺字段时保留本地已有值（与 heat/views 的合并策略一致）。
+    final merged = rated.merge(
+      const Drama(id: 'hongguo:rated', source: 'hongguo', title: '评分剧'),
+    );
+    expect(merged.score, '8.6');
+    expect(merged.actor, '张三,李四');
+    expect(merged.director, '王五');
+  });
+
   for (final failure in ['false', 'throw', 'after']) {
     test(
       'failed $failure writes keep favorites, preferences and progress after restart',

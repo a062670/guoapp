@@ -133,6 +133,38 @@ void main() {
     expect(store.sources.length, allSourcesEnabled ? 11 : 1);
   });
 
+  test('passwordless toggle hides and shows sources without a pin', () async {
+    final store = await create();
+    expect(store.sourceGateEnabled, isFalse);
+    expect(store.sourcesUnlocked, isFalse);
+
+    // 无需密码即可显示全部站源。
+    await store.setPasswordlessSourceHidden(false);
+    expect(store.sourcesUnlocked, isTrue);
+    expect(store.sources.length, allSourcesEnabled ? 11 : 1);
+
+    // 状态落盘，重启后仍是"显示全部"。
+    final restarted = testStore(store.preferences);
+    addTearDown(restarted.dispose);
+    expect(restarted.sourcesUnlocked, isTrue);
+
+    // 再切回隐藏，同样不需要密码。
+    await restarted.setPasswordlessSourceHidden(true);
+    expect(restarted.sourcesUnlocked, isFalse);
+    expect(restarted.sources.length, allSourcesEnabled ? 4 : 1);
+    expect(restarted.allowsSource('huangdou'), isFalse);
+  });
+
+  test('passwordless toggle refuses to run while a pin gate is on', () async {
+    final store = await create();
+    await store.enableSourceGate('666');
+    await expectLater(
+      store.setPasswordlessSourceHidden(true),
+      throwsStateError,
+    );
+    expect(store.sourceGateEnabled, isTrue);
+  });
+
   // 密码锁弹窗含动画与异步回调，用固定步进代替 pumpAndSettle，
   // 避免不收敛的动画让测试挂到 10 分钟默认超时。
   Future<void> settle(WidgetTester tester) async {
@@ -197,5 +229,43 @@ void main() {
     await settle(tester);
     expect(store.sourceGateEnabled, isFalse);
     expect(store.sourcesUnlocked, isTrue);
+  }, timeout: const Timeout(Duration(seconds: 60)));
+
+  testWidgets('the dialog toggles hiding without requiring a password', (
+    tester,
+  ) async {
+    final store = await create();
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: Builder(
+            builder: (context) => TextButton(
+              onPressed: () => showSourceGateDialog(context, store),
+              child: const Text('打开'),
+            ),
+          ),
+        ),
+      ),
+    );
+
+    // 默认未设密码且隐藏：弹窗直接提供「显示全部站源」，无需输入密码。
+    await tester.tap(find.text('打开'));
+    await settle(tester);
+    expect(find.text('显示全部站源'), findsOneWidget);
+    expect(find.text('隐藏敏感站源'), findsNothing);
+
+    await tester.tap(find.text('显示全部站源'));
+    await settle(tester);
+    expect(store.sourcesUnlocked, isTrue);
+    expect(store.sources.length, allSourcesEnabled ? 11 : 1);
+
+    // 再次打开（仍无密码）：按钮变为「隐藏敏感站源」。
+    await tester.tap(find.text('打开'));
+    await settle(tester);
+    expect(find.text('隐藏敏感站源'), findsOneWidget);
+    await tester.tap(find.text('隐藏敏感站源'));
+    await settle(tester);
+    expect(store.sourcesUnlocked, isFalse);
+    expect(store.sources.length, allSourcesEnabled ? 4 : 1);
   }, timeout: const Timeout(Duration(seconds: 60)));
 }

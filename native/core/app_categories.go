@@ -39,6 +39,15 @@ func validNativeCategory(source, category string) bool {
 	if len(category) > 128 || strings.ContainsAny(category, "|/\\\x00\r\n") {
 		return false
 	}
+	// LibreTV 分类即 MacCMS 的 type_id（数字）。
+	if strings.HasPrefix(source, sourceLibreTVPrefix) {
+		return webProviderNumericID.MatchString(category)
+	}
+	// drpy 脚本源的分类即脚本 home() 返回的 type_id，多为数字或短字符串，
+	// 无法静态预知，靠上面通用约束（非空、≤128、无分隔符）兜底。
+	if strings.HasPrefix(source, sourceDrpyPrefix) {
+		return true
+	}
 	switch source {
 	case sourceHongguo:
 		for _, genre := range hongguoAppGenres {
@@ -136,12 +145,27 @@ func (engine *nativeEngine) nativeCategories(ctx context.Context, source string,
 	case sourceHanxiaoquan:
 		all = append(all, d.fetchHanxiaoquanCategories()...)
 	default:
+		if site, ok := d.libretvSite(source); ok {
+			// ac=list 拿分类；站点不支持时保留「全部」，不报错。
+			if categories, err := d.fetchLibreTVCategories(ctx, site); err == nil {
+				all = append(all, categories...)
+			}
+			break
+		}
+		if site, ok := d.drpySite(source); ok {
+			// drpy 脚本跑 home({}) 拿分类；脚本未实现时保留「全部」，不报错。
+			if categories, err := d.fetchDrpyCategories(ctx, site); err == nil {
+				all = append(all, categories...)
+			}
+			break
+		}
 		return nil, errors.New("请选择有效站源")
 	}
 	if err != nil {
 		return nil, err
 	}
-	if len(all) == 1 {
+	// LibreTV / drpy 站点可能不支持分类枚举，此时只保留「全部」也算有效（浏览不分类）。
+	if len(all) == 1 && libretvKeyFromSource(source) == "" && drpyKeyFromSource(source) == "" {
 		return nil, errors.New("站源暂未返回内容分类，请稍后重试")
 	}
 	engine.mu.Lock()

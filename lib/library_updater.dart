@@ -26,6 +26,10 @@ class LibraryUpdater extends ChangeNotifier {
   bool _disposed = false;
   int _ticks = 0;
 
+  /// 上次通知监听者时的状态签名；状态没变就不再通知，避免首页被
+  /// 周期轮询（每 10 秒一次）反复全量重建——这是操作卡顿的主因。
+  String _notifiedSignature = '';
+
   bool get _valid =>
       !_disposed && !store.locked && _epoch == store.profileEpoch;
   SourceStatus? status(String source) => _statuses[source];
@@ -46,8 +50,28 @@ class LibraryUpdater extends ChangeNotifier {
     });
   }
 
+  /// 状态签名：任一源的状态 / 错误 / 进行中 / 停止请求变化都会改变它。
+  String _signature() {
+    final keys = _statuses.keys.toList()..sort();
+    final parts = <String>[
+      for (final key in keys)
+        '$key|${_statuses[key]!.operation}|${_statuses[key]!.startedAt}|'
+            '${_statuses[key]!.finishedAt}|${_statuses[key]!.updatedAt}|'
+            '${_statuses[key]!.count}|${_statuses[key]!.running}|'
+            '${_statuses[key]!.storageError}',
+      for (final key in _errors.keys.toList()..sort()) '$key!${_errors[key]}',
+      for (final key in _pending.toList()..sort()) '+$key',
+      for (final key in _stopRequested.toList()..sort()) '-$key',
+    ];
+    return parts.join(';');
+  }
+
   void _notify() {
-    if (_valid) notifyListeners();
+    if (!_valid) return;
+    final signature = _signature();
+    if (signature == _notifiedSignature) return;
+    _notifiedSignature = signature;
+    notifyListeners();
   }
 
   void _accept(SourceStatus status, {bool submitted = false}) {

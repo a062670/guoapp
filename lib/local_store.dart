@@ -1,4 +1,5 @@
 import 'dart:convert';
+import 'dart:math';
 
 import 'package:flutter/foundation.dart';
 import 'package:shared_preferences/shared_preferences.dart';
@@ -15,6 +16,21 @@ import 'lan_sync_models.dart';
 
 part 'local_store_sync.dart';
 part 'local_store_webdav.dart';
+
+/// 收藏 / 隐藏片源的一条持久化状态。
+///
+/// [on] 为 false 时是「取消墓碑」：时间戳保留，用于跨设备传播取消操作
+/// （WebDAV 同步按最新时间戳优先合并，没有墓碑就无法区分「从未收藏」
+/// 与「收藏后又取消」）。墓碑不清理，数量受 LanSourcePref.limit 约束。
+class _SourceStamp {
+  const _SourceStamp({required this.at, required this.on});
+
+  /// 生效时间（epoch 毫秒）。
+  final int at;
+
+  /// 当前是否生效（收藏中 / 隐藏中）。
+  final bool on;
+}
 
 class LocalStore extends ChangeNotifier {
   /// [pinHasher] 可注入，便于测试替换掉默认的 isolate 哈希实现。
@@ -37,6 +53,17 @@ class LocalStore extends ChangeNotifier {
   final Map<String, Drama> _favorites = {};
   final Map<String, FollowState> _followStates = {};
   final Map<String, Drama> _seriesCandidates = {};
+
+  /// 收藏的运行时片源 ID（`libretv:` / `drpy:`）→ 收藏状态时间戳。
+  /// 收藏后首页不再并入 LibreTV / drpy 大组，与红果等同级独占一组。
+  /// on=false 的条目是取消墓碑，仅用于跨设备同步，不视为收藏。
+  final Map<String, _SourceStamp> _favoriteStamps = {};
+
+  /// 隐藏的运行时片源 ID → 隐藏状态时间戳。
+  /// 隐藏后与黄果等敏感站源同逻辑：不出现在首页片源选择里，
+  /// allowsSource 直接拒绝（追剧/历史里的条目一并过滤），
+  /// 可在站源管理页恢复显示。on=false 为取消墓碑。
+  final Map<String, _SourceStamp> _hiddenStamps = {};
   Future<void> _writes = Future<void>.value();
   List<LocalProfile> _profiles = [];
   String _current = 'default';
@@ -137,7 +164,15 @@ class LocalStore extends ChangeNotifier {
       !locked &&
       SourceSite.isAvailable(source) &&
       profile.allows(source) &&
-      (_gateOff || _sourcesUnlocked || SourceSite.isPrimary(source));
+      // 用户导入的 LibreTV 片源与 drpy 脚本源视同内置主站源：导入即授权，
+      // 不占用敏感站源解锁。
+      (_gateOff ||
+          _sourcesUnlocked ||
+          SourceSite.isPrimary(source) ||
+          source.startsWith('libretv:') ||
+          source.startsWith('drpy:')) &&
+      // 被用户隐藏的运行时片源与黄果等隐藏源同逻辑：一律不可见。
+      !(_hiddenStamps[source]?.on == true);
   List<SourceSite> get sources => SourceSite.visibleValues(
     unlocked: _gateOff || _sourcesUnlocked,
   ).where((site) => allowsSource(site.id)).toList();
@@ -208,6 +243,137 @@ class LocalStore extends ChangeNotifier {
     _notify();
   }
 
+  /// 运行时站源注册表（LibreTV 导入/删除）变化后广播一次，
+  /// 让监听 [sources] 的界面（首页、站源管理等）立即刷新。
+  void notifySourceRegistryChanged() => _notify();
+
+  // ---- 运行时片源的收藏 / 隐藏 ----
+
+  /// 收藏的运行时片源 ID 集合（拷贝，避免外部改动内部状态）。
+  /// 取消墓碑（on=false）不计入。
+  Set<String> get favoriteSourceIds =>
+      {for (final entry in _favoriteStamps.entries) if (entry.value.on) entry.key};
+
+  /// 隐藏的运行时片源 ID 集合（拷贝，不含取消墓碑）。
+  Set<String> get hiddenSourceIds =>
+      {for (final entry in _hiddenStamps.entries) if (entry.value.on) entry.key};
+
+  bool isFavoriteSource(String id) => _favoriteStamps[id]?.on == true;
+
+  bool isHiddenSource(String id) => _hiddenStamps[id]?.on == true;
+
+  /// 收藏 / 取消收藏运行时片源。收藏后首页把它从 LibreTV / drpy 大组
+  /// 里拆出来独占一组（与红果同级）。仅 `libretv:` / `drpy:` 源有效。
+  Future<void> toggleFavoriteSource(String id) => _queue(() async {
+    final source = id.trim();
+    if (!source.startsWith('libretv:') && !source.startsWith('drpy:')) {
+      throw StateError('只能收藏导入的 LibreTV / drpy 片源');
+    }
+    final next = Map.of(_favoriteStamps);
+    next[source] = _SourceStamp(
+      at: DateTime.now().millisecondsSinceEpoch,
+      on: next[source]?.on != true,
+    );
+    await _commit({
+      _key('favoriteSources'): _encodeSourceStamps(next),
+    });
+    _loadLibrary();
+    _notify();
+  });
+
+  /// 隐藏 / 恢复运行时片源，与敏感站源（黄果等）同逻辑：
+  /// 隐藏后不出现在首页片源选择，allowsSource 拒绝其内容；
+  /// 在站源管理页点同一按钮可恢复。
+  Future<void> toggleSourceHidden(String id) => _queue(() async {
+    final source = id.trim();
+    if (!source.startsWith('libretv:') && !source.startsWith('drpy:')) {
+      throw StateError('只能隐藏导入的 LibreTV / drpy 片源');
+    }
+    final next = Map.of(_hiddenStamps);
+    next[source] = _SourceStamp(
+      at: DateTime.now().millisecondsSinceEpoch,
+      on: next[source]?.on != true,
+    );
+    await _commit({
+      _key('hiddenSources'): _encodeSourceStamps(next),
+    });
+    _loadLibrary();
+    _notify();
+  });
+
+  // ---- WebDAV 片源偏好同步 ----
+
+  /// 本机片源偏好快照：收藏 / 隐藏合并为 [LanSourcePref]，
+  /// at 取两项里较新的时间戳（含取消墓碑，保证取消可传播）。
+  Map<String, LanSourcePref> sourcePrefsSnapshot() => {
+    for (final id in {..._favoriteStamps.keys, ..._hiddenStamps.keys})
+      id: LanSourcePref(
+        favorite: _favoriteStamps[id]?.on == true,
+        hidden: _hiddenStamps[id]?.on == true,
+        at: max(_favoriteStamps[id]?.at ?? 0, _hiddenStamps[id]?.at ?? 0),
+      ),
+  };
+
+  /// 应用 WebDAV 合并回来的片源偏好（同步时自动导入策略的配套）。
+  ///
+  /// 仅当对端 [LanSourcePref.at] 比本机该源现有时间戳更新时才整体生效，
+  /// 避免旧数据回退；时间戳相同时按字段取并集（与 LanSourcePref.merge
+  /// 的并列规则一致）。返回发生状态变化的条目数。
+  Future<int> applySourcePrefs(Map<String, LanSourcePref> incoming) {
+    final epoch = _epoch;
+    return _queueResult<int>(() async {
+      if (locked || epoch != _epoch) {
+        throw StateError('当前用户已变更，请重试');
+      }
+      final favorites = Map.of(_favoriteStamps);
+      final hidden = Map.of(_hiddenStamps);
+      var changed = 0;
+      var wrote = false;
+      for (final entry in incoming.entries) {
+        final id = entry.key;
+        if (!id.startsWith('libretv:') && !id.startsWith('drpy:')) continue;
+        final next = entry.value;
+        final favoriteStamp = favorites[id];
+        final hiddenStamp = hidden[id];
+        final localAt = max(favoriteStamp?.at ?? 0, hiddenStamp?.at ?? 0);
+        if (next.at < localAt) continue;
+        // 并列时取并集：本机已生效的状态不被对端同时刻的取消覆盖。
+        final favorite = next.at == localAt
+            ? (favoriteStamp?.on == true || next.favorite)
+            : next.favorite;
+        final hide = next.at == localAt
+            ? (hiddenStamp?.on == true || next.hidden)
+            : next.hidden;
+        if (favorite != (favoriteStamp?.on == true) ||
+            hide != (hiddenStamp?.on == true)) {
+          changed++;
+        }
+        // 整条偏好记录的时间基准统一记为较近者，两个字段都刷新，
+        // 保证之后任意更新的对端记录都能正确覆盖。
+        final favoriteAt = max(next.at, favoriteStamp?.at ?? 0);
+        final hiddenAt = max(next.at, hiddenStamp?.at ?? 0);
+        if (favorite != (favoriteStamp?.on == true) ||
+            favoriteAt != (favoriteStamp?.at ?? 0)) {
+          favorites[id] = _SourceStamp(at: favoriteAt, on: favorite);
+          wrote = true;
+        }
+        if (hide != (hiddenStamp?.on == true) ||
+            hiddenAt != (hiddenStamp?.at ?? 0)) {
+          hidden[id] = _SourceStamp(at: hiddenAt, on: hide);
+          wrote = true;
+        }
+      }
+      if (!wrote) return 0;
+      await _commit({
+        _key('favoriteSources'): _encodeSourceStamps(favorites),
+        _key('hiddenSources'): _encodeSourceStamps(hidden),
+      });
+      _loadLibrary();
+      _notify();
+      return changed;
+    });
+  }
+
   /// 设置或更换密码锁，并立即解锁。
   Future<void> enableSourceGate(String pin) => _queue(() async {
     _requireAdmin();
@@ -248,12 +414,45 @@ class LocalStore extends ChangeNotifier {
     _notify();
   });
 
+  /// 无密码切换敏感站源可见性。
+  ///
+  /// [hide] 为 true 时隐藏（默认态，只有主站源可见），false 时显示全部。
+  /// 不要求设置密码：密码锁只是可选加强项，未启用时用 sourceGateOff=false
+  /// 表达"隐藏"、sourceGateOff=true 表达"显示全部"（沿用既有持久化字段，
+  /// 因此重启后状态不变）。
+  Future<void> setPasswordlessSourceHidden(bool hide) => _queue(() async {
+    _requireAdmin();
+    if (_gateEnabled) {
+      throw StateError('已启用密码锁，请先关闭密码功能');
+    }
+    final nextOff = !hide;
+    if (_gateOff == nextOff) return;
+    await _commit({
+      'sourceGateEnabled': false,
+      'sourceGateOff': nextOff,
+      'sourceGateSalt': '',
+      'sourceGateHash': '',
+    });
+    _gateEnabled = false;
+    _gateOff = nextOff;
+    _gateSalt = '';
+    _gateHash = '';
+    _sourcesUnlocked = false;
+    _notify();
+  });
+
   void _loadLibrary() {
     _lanDocumentCache = null;
     _history.clear();
     _favorites.clear();
     _followStates.clear();
     _seriesCandidates.clear();
+    _favoriteStamps
+      ..clear()
+      ..addAll(_readSourceStamps(_string(_key('favoriteSources'))));
+    _hiddenStamps
+      ..clear()
+      ..addAll(_readSourceStamps(_string(_key('hiddenSources'))));
     if (_configurationError != null) return;
     for (final row in readJsonList(_string(_key('history')))) {
       try {
@@ -580,6 +779,53 @@ class LocalStore extends ChangeNotifier {
   String _encodeFollowStates(Map<String, FollowState> states) => jsonEncode({
     for (final entry in states.entries) entry.key: entry.value.toJson(),
   });
+
+  /// 收藏 / 隐藏片源的持久化格式：`{源 ID: {at: epoch 毫秒, on: 是否生效}}`。
+  /// on=false 是取消墓碑，时间戳保留以便跨设备传播取消操作。
+  String _encodeSourceStamps(Map<String, _SourceStamp> stamps) => jsonEncode({
+    for (final entry in stamps.entries)
+      entry.key: {'at': entry.value.at, 'on': entry.value.on},
+  });
+
+  /// 读收藏 / 隐藏片源的时间戳表，兼容三种历史格式：
+  /// 1. 最早版：JSON 数组（无时间戳），统一按「生效、at=0」处理；
+  /// 2. 过渡版：`{源 ID: epoch 毫秒}` 对象（无 on 标记），按生效处理；
+  /// 3. 现行版：`{源 ID: {at, on}}`，on=false 为取消墓碑。
+  /// 解析失败按空表处理，与 readJsonList 的容错策略一致：坏数据不应让
+  /// 整个仓库打不开。
+  Map<String, _SourceStamp> _readSourceStamps(String? value) {
+    try {
+      final decoded = jsonDecode(value ?? '{}');
+      if (decoded is List) {
+        return {
+          for (final id in decoded.whereType<String>())
+            if (id.trim().isNotEmpty) id.trim(): const _SourceStamp(at: 0, on: true),
+        };
+      }
+      if (decoded is! Map) return {};
+      final result = <String, _SourceStamp>{};
+      for (final entry in decoded.entries) {
+        final id = (entry.key as String).trim();
+        if (id.isEmpty) continue;
+        final raw = entry.value;
+        if (raw is int) {
+          if (raw < 0 || raw > 9007199254740000) continue;
+          result[id] = _SourceStamp(at: raw, on: true);
+          continue;
+        }
+        if (raw is! Map) continue;
+        final at = raw['at'];
+        final on = raw['on'];
+        if (at is! int || at < 0 || at > 9007199254740000 || on is! bool) {
+          continue;
+        }
+        result[id] = _SourceStamp(at: at, on: on);
+      }
+      return result;
+    } catch (_) {
+      return {};
+    }
+  }
 
   Future<void> setFollowStatus(Drama drama, FollowStatus status) {
     final epoch = _epoch;
@@ -1242,6 +1488,17 @@ class LocalStore extends ChangeNotifier {
   Future<void> _queue(Future<void> Function() action) {
     _writes = _writes.catchError((Object _) {}).then((_) => action());
     return _writes;
+  }
+
+  /// _queue 的带返回值版本：写队列保持串行，调用方拿到 action 的真实结果/错误。
+  ///
+  /// 重放适配说明：本方法最初由红果账号数据同步（逆向线提交 93f8a1d）引入，
+  /// 后被 +124 片源偏好同步的 applySourcePrefs 复用；合并进主线时补回，
+  /// 与红果账号体系无关，是通用的串行写队列基础设施。
+  Future<T> _queueResult<T>(Future<T> Function() action) {
+    final result = _writes.catchError((Object _) {}).then((_) => action());
+    _writes = result.then((_) {}, onError: (Object _) {});
+    return result;
   }
 
   @override

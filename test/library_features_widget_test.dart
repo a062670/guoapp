@@ -397,4 +397,70 @@ void main() {
       await tester.pumpWidget(const SizedBox.shrink());
     });
   }
+
+  testWidgets('detail shows score, cast and director in the overview', (
+    tester,
+  ) async {
+    viewport(tester, const Size(390, 844));
+    const drama = Drama(
+      id: 'hongguo:rated',
+      source: 'hongguo',
+      title: '评分剧',
+      episodes: 12,
+      score: '8.6',
+      actor: '张三,李四',
+      director: '王五',
+    );
+    final store = await create();
+    final repository = LibraryFeatureRepository()
+      ..details[drama.id] = LibraryFeatureRepository.makeDetail(drama, 12);
+    await tester.pumpWidget(
+      MaterialApp(
+        home: DetailScreen(
+          drama: drama,
+          repository: repository,
+          store: store,
+        ),
+      ),
+    );
+    await tester.pumpAndSettle();
+    // 评分并入信息行（来源 · 集数 · 状态），放在最前面。
+    expect(find.textContaining('★ 8.6'), findsOneWidget);
+    // 英文逗号分隔的演员表统一渲染成中文顿号。
+    expect(find.text('主演：张三、李四'), findsOneWidget);
+    expect(find.text('导演：王五'), findsOneWidget);
+    expect(tester.takeException(), isNull);
+    await tester.pumpWidget(const SizedBox.shrink());
+  });
+
+  testWidgets('detail keeps the overview compact when metadata is absent', (
+    tester,
+  ) async {
+    viewport(tester, const Size(390, 844));
+    const drama = Drama(
+      id: 'hongguo:plain-cast',
+      source: 'hongguo',
+      title: '无剧组',
+      episodes: 3,
+    );
+    final store = await create();
+    final repository = LibraryFeatureRepository()
+      ..details[drama.id] = LibraryFeatureRepository.makeDetail(drama, 3);
+    await tester.pumpWidget(
+      MaterialApp(
+        home: DetailScreen(
+          drama: drama,
+          repository: repository,
+          store: store,
+        ),
+      ),
+    );
+    await tester.pumpAndSettle();
+    // 无值时不渲染占位标签，也不出现空壳的「主演：」。
+    expect(find.textContaining('★'), findsNothing);
+    expect(find.textContaining('主演：'), findsNothing);
+    expect(find.textContaining('导演：'), findsNothing);
+    expect(tester.takeException(), isNull);
+    await tester.pumpWidget(const SizedBox.shrink());
+  });
 }

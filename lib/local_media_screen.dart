@@ -430,6 +430,7 @@ class _LocalFileRepository extends AppRepository {
     Drama drama,
     Episode episode, {
     int quality = 0,
+    int route = 0,
   }) => _plan();
   @override
   Future<PlaybackPlan?> localPlayback(Drama drama, Episode episode) => _plan();

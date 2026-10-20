@@ -162,7 +162,13 @@ func (engine *nativeEngine) nativeNextPlayback(ctx context.Context, session stri
 	if !exists {
 		return nativePlan{}, errors.New("播放线路已失效，请重新解析播放")
 	}
-	choice.index++
+	// 环形回退：最后一条线路也能回到首选线路。线路记忆可能停在备用线上，
+	// 只往前加会让它永远没有机会重新试默认线（即使默认线已经恢复）。
+	if len(choice.media) > 0 {
+		choice.index = (choice.index + 1) % len(choice.media)
+	} else {
+		choice.index++
+	}
 	return engine.nativeOpenPlayback(ctx, choice)
 }
 

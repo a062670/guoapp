@@ -86,11 +86,37 @@ func splitProviderDramaID(id string) (source, sourceID string, ok bool) {
 	if !ok || strings.TrimSpace(sourceID) == "" || !isHuangguoProviderSource(source) {
 		return "", "", false
 	}
+	// LibreTV / drpy 站源的剧集 ID 形如 libretv:<key>:<vodId>：第一刀只切出家族名
+	// "libretv"，需要再切一刀才是完整站源 key 与片源 ID。分集 ID 同理
+	// （libretv:<key>:<vodId>:<集键>），sourceID 末尾多带的集键不影响
+	// 调用方只比较 source 的用法。drpy 的 vodId 是 base64url（无冒号），
+	// 切分规则相同。
+	if source == sourceLibreTV || source == sourceDrpy {
+		siteKey, vodID, found := strings.Cut(sourceID, ":")
+		siteKey, vodID = strings.TrimSpace(siteKey), strings.TrimSpace(vodID)
+		if !found || siteKey == "" || vodID == "" {
+			return "", "", false
+		}
+		if source == sourceDrpy {
+			return drpySourceID(siteKey), vodID, true
+		}
+		return libretvSourceID(siteKey), vodID, true
+	}
 	return source, strings.TrimSpace(sourceID), true
 }
 
 func isHuangguoProviderSource(source string) bool {
-	switch canonicalProviderSource(source) {
+	source = canonicalProviderSource(source)
+	// 运行时导入的 LibreTV（MacCMS provide/vod）与 drpy 脚本源：家族名
+	// "libretv"/"drpy" 与完整源 "libretv:<key>"/"drpy:<key>" 都要认
+	// （ID 切分第一刀只会切出家族名）。
+	if source == sourceLibreTV || strings.HasPrefix(source, sourceLibreTVPrefix) {
+		return true
+	}
+	if source == sourceDrpy || strings.HasPrefix(source, sourceDrpyPrefix) {
+		return true
+	}
+	switch source {
 	case sourceHuangguoAI, sourceHuangguoVideo, sourceHuangdou, sourceHongguo, sourceHuangju, sourceYeguo, sourceDSD, sourceCloudFront, sourceSorani, sourceGuipian, sourceHanxiaoquan:
 		return true
 	default:
@@ -180,6 +206,12 @@ func mergeDramaMetadata(base, extra Drama) Drama {
 	if strings.TrimSpace(base.Score) == "" {
 		base.Score = extra.Score
 	}
+	if strings.TrimSpace(base.Actor) == "" {
+		base.Actor = extra.Actor
+	}
+	if strings.TrimSpace(base.Director) == "" {
+		base.Director = extra.Director
+	}
 	if strings.TrimSpace(base.Views) == "" {
 		base.Views = extra.Views
 	}
@@ -243,6 +275,24 @@ func (d *Downloader) GetHuangguoChapters(ctx context.Context, source, sourceID s
 	case sourceCloudFront:
 		return d.fetchLegacyChapters(ctx, sourceID)
 	default:
+		if siteKey := libretvKeyFromSource(source); siteKey != "" {
+			site, ok := d.libretvSite(source)
+			if !ok {
+				return "", nil, errors.New("LibreTV 片源未导入或已删除，请在站源管理重新导入")
+			}
+			drama, chapters, err := d.fetchLibreTVDetail(ctx, site, sourceID)
+			return drama.DisplayTitle(), chapters, err
+		}
+		// drpy / CatVod 脚本源：检测（app_source_health.go）与盒子端都用
+		// 这个入口取分集，缺这一支会报 unsupported provider source。
+		if drpyKeyFromSource(source) != "" {
+			site, ok := d.drpySite(source)
+			if !ok {
+				return "", nil, errors.New("脚本源未导入或已删除，请在站源管理重新导入")
+			}
+			drama, chapters, err := d.fetchDrpyDetail(ctx, site, sourceID)
+			return drama.DisplayTitle(), chapters, err
+		}
 		return "", nil, fmt.Errorf("unsupported provider source: %s", source)
 	}
 }

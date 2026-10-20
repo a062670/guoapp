@@ -38,6 +38,16 @@ void main() {
     expect(recovery.next(route(3, count: 10)), PlaybackRecoveryAction.stop);
   });
 
+  test('a route remembered at the last index wraps back to the first', () {
+    final recovery = PlaybackRecovery();
+    // 记忆停在 2/3（最后一条）：下一条应回到首选线路（0），而不是只重解析。
+    expect(recovery.next(route(2)), PlaybackRecoveryAction.alternative);
+    expect(recovery.next(route(0)), PlaybackRecoveryAction.alternative);
+    // 1 → 下一条 2 已试过，转入重新解析；刷新后各线路可再试一遍。
+    expect(recovery.next(route(1)), PlaybackRecoveryAction.refresh);
+    expect(recovery.next(route(0)), PlaybackRecoveryAction.stop);
+  });
+
   test(
     'a stalled foreground stream times out but paused and background playback do not',
     () {

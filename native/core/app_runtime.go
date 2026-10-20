@@ -71,6 +71,12 @@ type Downloader struct {
 	legacy                *legacyAPIClient
 	previewMu             sync.Mutex
 	previewSessions       map[string]*huangguoPreviewSession
+	// libretv 运行时导入的 LibreTV（MacCMS provide/vod）站源表，
+	// 由 newNativeEngine 从引擎目录 libretv.json 载入。
+	libretv *libretvStore
+	// drpy 运行时导入的 drpy 脚本源表（goja 执行），
+	// 由 newNativeEngine 从引擎目录 drpy.json + scripts/ 载入。
+	drpy *drpyStore
 }
 
 func defaultConfig() Config { return Config{MaxPagesPerSort: 50, PageSize: 30, Retries: 2} }
@@ -91,6 +97,7 @@ type nativeDrama struct {
 	OnlineDate     string   `json:"onlineDate,omitempty"`
 	Tags           []string `json:"tags,omitempty"`
 	ReleaseStatus  string   `json:"releaseStatus,omitempty"`
+	UpdateTime     string   `json:"updateTime,omitempty"`
 }
 
 type nativeInput struct {
@@ -116,6 +123,14 @@ type nativeInput struct {
 	Chapter          Chapter                 `json:"chapter"`
 	Index            int                     `json:"index"`
 	Quality          int                     `json:"quality"`
+	Subscription string `json:"subscription"`
+	LibreTVKey   string `json:"libretvKey"`
+	// ParseURL 选择 LibreTV 解析方式（parses 里的 url）；空 = 直链/嗅探。
+	ParseURL string `json:"parseUrl"`
+	// drpy 脚本源：subscription 复用为 JS 文本或脚本 URL；drpyKey 为删除时的 key。
+	DrpyKey string `json:"drpyKey"`
+	// Route 期望的起始线路（线路记忆用；越界或不存在时回落到 0）。
+	Route    int    `json:"route"`
 	Session          string                  `json:"session"`
 	Sequence         int64                   `json:"sequence"`
 	Force            bool                    `json:"force"`
@@ -145,6 +160,9 @@ type nativePlan struct {
 	Session         string            `json:"session,omitempty"`
 	RouteIndex      int               `json:"routeIndex"`
 	RouteCount      int               `json:"routeCount"`
+	// Verified 预加载已确认该线路可取到数据（首字节在预算内）。未验证时
+	// 播放器会把首帧等待阈值收紧，尽快切到下一条线路。
+	Verified bool `json:"verified,omitempty"`
 }
 
 type nativeEngine struct {
@@ -233,7 +251,8 @@ func nativeNormalize(drama Drama) nativeDrama {
 		Description: firstNonEmpty(drama.Desc, drama.Intro), Cover: cover, Episodes: episodes,
 		Category: nativeDramaCategory(drama), VIP: drama.VIP,
 		Heat: drama.Heat, Views: drama.Views, OnlineDate: providerReleaseDate(drama.OnlineDate),
-		Tags: append([]string(nil), drama.Tags...), ReleaseStatus: drama.ReleaseStatus}
+		Tags: append([]string(nil), drama.Tags...), ReleaseStatus: drama.ReleaseStatus,
+		UpdateTime: drama.UpdateTime}
 }
 
 func nativeDramaCategory(drama Drama) string {
@@ -278,6 +297,8 @@ func newNativeEngine(directory string) (*nativeEngine, error) {
 		}}
 	engine := &nativeEngine{downloader: d, directory: directory, catalogs: map[string][]nativeDrama{}, catalogStates: map[string]nativeCatalogState{}}
 	engine.loadResourceSettings()
+	d.libretv = loadLibreTVStore(directory)
+	d.drpy = loadDrpyStore(directory)
 	d.loadRankingCache()
 	engine.loadCatalogCache()
 	engine.loadSourceRecords()
@@ -454,6 +475,28 @@ func nativeDispatch(input nativeInput) (any, error) {
 		return engine.startSourceTask(input.Source, input.Command, input.Drama)
 	case "cancelSourceJob":
 		return engine.cancelSourceTask(input.Source), nil
+	case "libretvSites":
+		return map[string]any{"sites": engine.libretvSiteList()}, nil
+	case "libretvImport":
+		return engine.importLibreTVSubscription(ctx, input.Subscription)
+	case "libretvRemove":
+		if err := engine.removeLibreTVSite(input.LibreTVKey); err != nil {
+			return nil, err
+		}
+		return map[string]any{"removed": input.LibreTVKey}, nil
+	case "libretvParseConfig":
+		return engine.libretvParseConfig(), nil
+	case "libretvSelectParse":
+		return engine.libretvSetParse(input.ParseURL)
+	case "drpySites":
+		return map[string]any{"sites": engine.drpySiteList()}, nil
+	case "drpyImport":
+		return engine.importDrpyScript(ctx, input.Subscription)
+	case "drpyRemove":
+		if err := engine.removeDrpySite(input.DrpyKey); err != nil {
+			return nil, err
+		}
+		return map[string]any{"removed": input.DrpyKey}, nil
 	case "cover":
 		return engine.loadCover(ctx, input.Drama, input.Force)
 	case "prepareCover":
@@ -595,6 +638,30 @@ func (engine *nativeEngine) nativeCatalog(ctx context.Context, input nativeInput
 		return result, nil
 	}
 	if query != "" {
+		if site, ok := engine.downloader.libretvSite(source); ok {
+			// LibreTV 站源走 MacCMS 的 wd 在线搜索，与站内搜索保持一致。
+			dramas, more, err := engine.downloader.fetchLibreTVCatalogPage(ctx, site, 1, "", query)
+			if err != nil {
+				return result, err
+			}
+			for _, drama := range dramas {
+				result.Items = append(result.Items, nativeNormalize(drama))
+			}
+			result.HasMore = more
+			return result, nil
+		}
+		if site, ok := engine.downloader.drpySite(source); ok {
+			// drpy 脚本源走脚本的 search(wd, quick, pg)。
+			dramas, more, err := engine.downloader.fetchDrpyCatalogPage(ctx, site, 1, "", query)
+			if err != nil {
+				return result, err
+			}
+			for _, drama := range dramas {
+				result.Items = append(result.Items, nativeNormalize(drama))
+			}
+			result.HasMore = more
+			return result, nil
+		}
 		engine.mu.Lock()
 		items := append([]nativeDrama{}, engine.catalogs[source]...)
 		engine.mu.Unlock()
@@ -686,10 +753,21 @@ func (engine *nativeEngine) nativeCatalog(ctx context.Context, input nativeInput
 	case sourceCloudFront:
 		items, result.HasMore, err = d.fetchLegacyCatalogCategoryPage(ctx, page, category)
 	}
+	// LibreTV 站源是动态 key，无法写进上面的 switch；放其后覆盖赋值。
+	// switch 没有匹配分支时 items/err 保持原值，不会被覆盖。
+	if site, ok := engine.downloader.libretvSite(source); ok {
+		items, result.HasMore, err = d.fetchLibreTVCatalogPage(ctx, site, page, category, query)
+	} else if site, ok := engine.downloader.drpySite(source); ok {
+		items, result.HasMore, err = d.fetchDrpyCatalogPage(ctx, site, page, category, query)
+	} else if libretvKeyFromSource(source) != "" {
+		items, err = nil, errors.New("LibreTV 片源未导入或已删除，请在站源管理重新导入")
+	} else if drpyKeyFromSource(source) != "" {
+		items, err = nil, errors.New("drpy 脚本源未导入或已删除，请在站源管理重新导入")
+	}
 	if err != nil && len(items) == 0 {
 		return result, err
 	}
-	if len(items) == 0 && page == 1 && source != sourceHuangju && source != sourceYeguo && source != sourceDSD && source != sourceSorani && source != sourceGuipian && source != sourceHanxiaoquan {
+	if len(items) == 0 && page == 1 && libretvKeyFromSource(source) == "" && drpyKeyFromSource(source) == "" && source != sourceHuangju && source != sourceYeguo && source != sourceDSD && source != sourceSorani && source != sourceGuipian && source != sourceHanxiaoquan {
 		return result, errors.New("站源暂未返回剧集，请稍后刷新")
 	}
 	if err != nil {
@@ -736,7 +814,17 @@ func (engine *nativeEngine) nativeDetail(ctx context.Context, drama nativeDrama)
 	case sourceHanxiaoquan:
 		raw, chapters, err = engine.downloader.fetchHanxiaoquanDetail(ctx, sourceID)
 	default:
-		title, chapters, err = engine.downloader.GetHuangguoChapters(ctx, source, sourceID)
+		if site, ok := engine.downloader.libretvSite(source); ok {
+			raw, chapters, err = engine.downloader.fetchLibreTVDetail(ctx, site, sourceID)
+		} else if site, ok := engine.downloader.drpySite(source); ok {
+			raw, chapters, err = engine.downloader.fetchDrpyDetail(ctx, site, sourceID)
+		} else if libretvKeyFromSource(source) != "" {
+			err = errors.New("LibreTV 片源未导入或已删除，请在站源管理重新导入")
+		} else if drpyKeyFromSource(source) != "" {
+			err = errors.New("drpy 脚本源未导入或已删除，请在站源管理重新导入")
+		} else {
+			title, chapters, err = engine.downloader.GetHuangguoChapters(ctx, source, sourceID)
+		}
 	}
 	if err != nil {
 		return nil, err
@@ -790,6 +878,11 @@ func (engine *nativeEngine) nativeResolve(ctx context.Context, input nativeInput
 		return nativePlan{}, err
 	}
 	choice := nativePlaybackChoices(media, input.Quality)
+	// 线路记忆：上次这台设备上该剧成功播放的线路优先，减少"先试一条慢线"的
+	// 等待。越界说明线路数变了（源站改版），安全回落到首选线路。
+	if input.Route > 0 && input.Route < len(choice.media) {
+		choice.index = input.Route
+	}
 	if series, video, valid := hongguoPlaybackIDs(task); valid {
 		choice.danmakuSeries, choice.danmakuVideo = series, video
 	}

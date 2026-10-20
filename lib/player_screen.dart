@@ -1,5 +1,4 @@
 import 'dart:async';
-import 'dart:convert';
 import 'dart:io';
 
 import 'package:flutter/material.dart';
@@ -21,10 +20,12 @@ import 'download_picker.dart';
 import 'downloads_screen.dart';
 import 'follow_state.dart';
 import 'local_store.dart';
+import 'libretv.dart';
 import 'models.dart';
 import 'playback_loader.dart';
 import 'playback_preloader.dart';
 import 'playback_recovery.dart';
+import 'playback_route_memory.dart';
 import 'playback_preferences.dart';
 import 'player_controls.dart';
 import 'player_interactions.dart';
@@ -36,6 +37,7 @@ import 'lan_controller.dart';
 import 'lan_screen.dart';
 import 'video_enhancement.dart';
 import 'video_output_size.dart';
+import 'webview_sniffer.dart';
 
 class PlayerScreen extends StatefulWidget {
   const PlayerScreen({
@@ -76,6 +78,12 @@ class _PlayerScreenState extends State<PlayerScreen>
   late final VideoEnhancementController _enhancement;
   late final PlaybackLoader _loader;
   late final PlaybackPreloader _preloader;
+
+  /// 当前选中的 LibreTV 解析方式（仅 type 0/4 的 WebView 嗅探会用到）。
+  LibreTVParse? _webViewParse;
+
+  /// 解析方式读取完成的信号：首集播放可能早于配置返回，必须先等它。
+  late final Future<void> _webViewParseReady;
   bool _preloadEnabled = true;
   late final DanmakuController _danmaku;
   int _seekSequence = 0;
@@ -95,6 +103,12 @@ class _PlayerScreenState extends State<PlayerScreen>
   final _health = PlaybackHealth();
   Timer? _saveTimer;
   Timer? _healthTimer;
+
+  /// 首帧看门狗：起播后迟迟没有画面就切线路（本地操作，零解析请求）。
+  Timer? _firstFrameTimer;
+
+  /// 本集是否已经用过一次快速切换，避免连续误杀。
+  bool _fastSwitched = false;
   Timer? _errorTimer;
   Timer? _pictureInPictureExitTimer;
   Timer? _volumeSaveTimer;
@@ -133,6 +147,11 @@ class _PlayerScreenState extends State<PlayerScreen>
   double _holdSpeed = defaultHoldSpeed;
   double _volume = 100;
   double _aspectRatio = 9 / 16;
+
+  /// 自动检测到的片源像素尺寸（0 表示尚未检测到）。
+  /// 来源：播放器解码后的 videoParams（mpv w/h），换集/换线路时重置。
+  int _videoWidth = 0;
+  int _videoHeight = 0;
   double _resumePosition = 0;
   bool _rotating = false;
   bool _television = false;
@@ -161,11 +180,25 @@ class _PlayerScreenState extends State<PlayerScreen>
     volume: _volume,
     enhancement: _enhancement.preferences,
   );
-  String get _qualityLabel => _plan?.local == true
-      ? '本地原画'
-      : _requestedQuality == 0
-      ? '自动'
-      : '${_requestedQuality}P';
+  String get _qualityLabel {
+    if (_plan?.local == true) return '本地原画';
+    // 没有真实画质档位但有多条线路时（LibreTV 多播放源），按钮直接显示
+    // 当前线路名，避免一直显示「自动」让人以为清晰度选择失效。
+    final hasQualities = (_plan?.qualities ?? const []).any((q) => q > 0);
+    if (!hasQualities) {
+      final lines = _lineOptions;
+      if (lines.length > 1) {
+        for (final line in lines) {
+          if (line.index == _index) return line.label;
+        }
+      }
+      // 本源没有画质档位：显示「自动」。清晰度偏好是全局的（比如在红果
+      // 选过 1080P），不能泄漏到没有画质概念的采集源 / 脚本源上。
+      return '自动';
+    }
+    return _requestedQuality == 0 ? '自动' : '${_requestedQuality}P';
+  }
+
   String get _session => _plan?.session ?? '';
   double get _currentPosition =>
       _openedIndex == _index && _player.state.position.inMilliseconds > 0
@@ -190,6 +223,7 @@ class _PlayerScreenState extends State<PlayerScreen>
     _preloadEnabled = true;
     _loader = PlaybackLoader(widget.repository);
     _preloader = PlaybackPreloader(widget.repository);
+    _webViewParseReady = _loadWebViewParse();
     _danmaku = DanmakuController(widget.repository)
       ..setEnabled(_danmakuEnabled);
     widget.store.addListener(_accessChanged);
@@ -284,6 +318,14 @@ class _PlayerScreenState extends State<PlayerScreen>
         if (!_closed && _openedIndex == _index && position > Duration.zero) {
           _resumePosition = position.inMilliseconds / 1000;
         }
+        if (!_closed && position > const Duration(seconds: 2)) {
+          // 画面已经在走：撤销快速切换的看门狗，并记住这条线路（零请求）。
+          _cancelFirstFrameWatchdog();
+          final plan = _plan;
+          if (plan != null && !plan.local) {
+            playbackRouteMemory.remember(widget.detail.drama, plan.routeIndex);
+          }
+        }
         _syncDanmaku();
         _syncPreload();
         _acknowledgeHandoff();
@@ -311,6 +353,10 @@ class _PlayerScreenState extends State<PlayerScreen>
         if (size != null && mounted && !_closed) {
           setState(() {
             _aspectRatio = size.width / size.height;
+            // 自动检测片源尺寸：优先用显示尺寸（含旋转修正），
+            // 组件按高度折算 480P/1080P/2K/4K 档位。
+            _videoWidth = size.width.round();
+            _videoHeight = size.height.round();
           });
           _scheduleSystemUi();
         }
@@ -675,6 +721,12 @@ class _PlayerScreenState extends State<PlayerScreen>
 
   void _syncPreload() {
     if (_closed) return;
+    // WebView 嗅探类解析（type 0/4）在 Go 侧取不到流，预加载没有意义，
+    // 直接停掉，避免每 30 秒一次的无用解析请求。
+    if (_webViewParse != null) {
+      _preloader.pause();
+      return;
+    }
     if (!_preloadEnabled ||
         !_foreground ||
         widget.localOnly ||
@@ -705,6 +757,7 @@ class _PlayerScreenState extends State<PlayerScreen>
       widget.detail.drama,
       widget.detail.episodes[_index + 1],
       quality: _requestedQuality,
+      route: playbackRouteMemory.routeOf(widget.detail.drama),
     );
   }
 
@@ -795,6 +848,31 @@ class _PlayerScreenState extends State<PlayerScreen>
     });
   }
 
+  /// 起播后若在阈值内拿不到首帧，直接切下一条线路。
+  ///
+  /// 切线路走 fallback = 本地 index++，不重新解析、不新增请求，所以早切的
+  /// 代价远小于"用户盯着转圈十几秒"。已验证线路放宽到 6 秒，避免误杀慢线。
+  void _armFirstFrameWatchdog(PlaybackPlan plan, int ticket) {
+    _cancelFirstFrameWatchdog();
+    if (plan.local || !plan.hasAlternative || _fastSwitched) return;
+    final delay = plan.verified
+        ? const Duration(seconds: 6)
+        : const Duration(seconds: 3);
+    _firstFrameTimer = Timer(delay, () {
+      if (_closed || ticket != _generation || _error != null) return;
+      final state = _player.state;
+      if (state.position > Duration.zero || (state.width ?? 0) > 0) return;
+      _fastSwitched = true;
+      DiaryService.add('[Play] 首帧 ${delay.inSeconds}s 未到，切换备用线路');
+      unawaited(_recover());
+    });
+  }
+
+  void _cancelFirstFrameWatchdog() {
+    _firstFrameTimer?.cancel();
+    _firstFrameTimer = null;
+  }
+
   Future<void> _recover() async {
     final current = _plan;
     if (_closed ||
@@ -807,6 +885,7 @@ class _PlayerScreenState extends State<PlayerScreen>
     _acceptErrors = false;
     _danmaku.setPlan(null);
     _errorTimer?.cancel();
+    _firstFrameTimer?.cancel();
     _pendingError = false;
     final position = _currentPosition;
     final action = current.local
@@ -814,6 +893,8 @@ class _PlayerScreenState extends State<PlayerScreen>
         : _recovery.next(current);
     if (action == PlaybackRecoveryAction.stop) {
       _resumePosition = position;
+      // 连续失败：清掉该剧的线路记忆，下次回到默认线路重新试。
+      playbackRouteMemory.forget(widget.detail.drama);
       final ticket = _generation;
       try {
         await _serialize(() async {
@@ -841,6 +922,11 @@ class _PlayerScreenState extends State<PlayerScreen>
         });
       }
       return;
+    }
+    if (action == PlaybackRecoveryAction.refresh) {
+      // 重新解析时回到默认线路：线路记忆是「当时可用」，默认线可能已经恢复。
+      // 每次恢复只多一次解析请求（原本就要重新解析），不会额外增加风控压力。
+      playbackRouteMemory.forget(widget.detail.drama);
     }
     await _play(_index, position: position, recoveryAction: action);
   }
@@ -911,6 +997,65 @@ class _PlayerScreenState extends State<PlayerScreen>
     return next;
   }
 
+  /// 读取 LibreTV 当前选中的解析方式；只有 type 0/4 需要 WebView 嗅探。
+  Future<void> _loadWebViewParse() async {
+    try {
+      final config = await widget.repository.libretvParseConfig();
+      if (!mounted || _closed) return;
+      LibreTVParse? selected;
+      for (final parse in config.parses) {
+        if (parse.url == config.selected) {
+          selected = parse;
+          break;
+        }
+      }
+      final needsWebView =
+          selected != null && (selected.type == 0 || selected.type == 4);
+      setState(() => _webViewParse = needsWebView ? selected : null);
+    } catch (_) {
+      // 非原生环境 / 旧核心：按直链处理。
+    }
+  }
+
+  /// type 0/4 解析：用内置 WebView 打开播放页，截获媒体请求后把章节地址
+  /// 替换成直链，Go 侧就会按直链播放（解析只对非直链生效，不会二次解析）。
+  Future<Episode> _prepareWebViewEpisode(Episode episode) async {
+    await _webViewParseReady;
+    final parse = _webViewParse;
+    if (parse == null) return episode;
+    if (!(episode.raw['source'] as String? ?? '').startsWith('libretv:')) {
+      return episode;
+    }
+    final address = (episode.raw['videoUrl'] as String? ?? '').trim();
+    if (address.isEmpty || WebViewSniffer.looksLikeMediaUrl(address)) {
+      return episode;
+    }
+    if (!WebViewSniffer.supported) {
+      throw AppFailure(
+        '「${parse.name}」需要 WebView 嗅探，当前平台不支持；'
+        '请在站源管理改用「直链/嗅探」或本地解析脚本。',
+      );
+    }
+    if (mounted && !_closed) {
+      setState(() => _loadingMessage = '正在用内置浏览器嗅探播放地址…');
+    }
+    final sniffed = await WebViewSniffer.shared.sniff(
+      address,
+      referer: (episode.raw['referer'] as String? ?? '').trim(),
+    );
+    if (sniffed == null || sniffed.isEmpty) {
+      throw AppFailure('WebView 未嗅探到播放地址，请换解析方式或稍后重试。');
+    }
+    DiaryService.add('[Parse] WebView 嗅探成功: $sniffed');
+    return Episode({
+      ...episode.raw,
+      'videoUrl': sniffed,
+      // 播放页作为 Referer 命中率最高（部分 CDN 校验来源页）。
+      'referer': address,
+      'currentEpisode': episode.number,
+    }, episode.number);
+  }
+
   Future<void> _play(
     int index, {
     double position = 0,
@@ -941,6 +1086,7 @@ class _PlayerScreenState extends State<PlayerScreen>
                 widget.detail.episodes[index],
                 quality: _requestedQuality,
                 online: _forceOnline,
+                route: playbackRouteMemory.routeOf(widget.detail.drama),
               )
             : null);
     _preloader.clear();
@@ -951,9 +1097,11 @@ class _PlayerScreenState extends State<PlayerScreen>
     _acceptErrors = false;
     _pendingError = false;
     _errorTimer?.cancel();
+    _firstFrameTimer?.cancel();
     _health.reset();
     if (recoveryAction == null) {
       _recovery.reset();
+      _fastSwitched = false;
       _playIntent = playWhenReady;
     }
     _resumePosition = position;
@@ -963,6 +1111,10 @@ class _PlayerScreenState extends State<PlayerScreen>
       _loading = true;
       _error = null;
       _localFailure = false;
+      // 换集/换线路后片源尺寸可能完全不同，先清掉上一条的检测结果，
+      // 等新片源起播后由 videoParams 重新填入，避免显示上一集的档位。
+      _videoWidth = 0;
+      _videoHeight = 0;
       _loadingMessage = switch (recoveryAction) {
         PlaybackRecoveryAction.alternative => '正在切换备用线路',
         PlaybackRecoveryAction.refresh => '正在重新获取播放地址',
@@ -996,16 +1148,24 @@ class _PlayerScreenState extends State<PlayerScreen>
       if (_closed || ticket != _generation) {
         return;
       }
+      // WebView 嗅探（type 0/4）只在真正要重新取流时执行：线路切换与
+      // 预加载结果都不需要，避免重复打开浏览器。嗅探较慢，放在后台解析前。
+      Episode playEpisode = widget.detail.episodes[index];
+      if (retained == null && warmed == null) {
+        playEpisode = await _prepareWebViewEpisode(playEpisode);
+        if (_closed || ticket != _generation) return;
+      }
       prepared = retained != null
           ? await _loader.fallback(retained!)
           : warmed != null
           ? await _loader.use(warmed)
           : await _loader.load(
               widget.detail.drama,
-              widget.detail.episodes[index],
+              playEpisode,
               quality: _requestedQuality,
               localOnly: widget.localOnly,
               online: _forceOnline,
+              route: playbackRouteMemory.routeOf(widget.detail.drama),
             );
       if (prepared == null) {
         return;
@@ -1090,6 +1250,7 @@ class _PlayerScreenState extends State<PlayerScreen>
           return;
         }
         _openedIndex = index;
+        _armFirstFrameWatchdog(plan, ticket);
         _enhancement.mediaReady();
         _attachLanPlayback();
         _health.reset();
@@ -1330,6 +1491,30 @@ class _PlayerScreenState extends State<PlayerScreen>
     );
   }
 
+  /// 当前集的同线路章节（LibreTV 多播放源在详情里是「第N集·源名」的并列项）。
+  /// 只有一集时返回空列表，播放器菜单据此隐藏「线路」区块。
+  List<PlayerLine> get _lineOptions {
+    final episodes = widget.detail.episodes;
+    if (_index < 0 || _index >= episodes.length) return const [];
+    final number = episodes[_index].number;
+    final options = <PlayerLine>[];
+    for (var i = 0; i < episodes.length; i++) {
+      if (episodes[i].number != number) continue;
+      options.add(
+        PlayerLine(index: i, label: _lineLabel(episodes[i], options.length)),
+      );
+    }
+    return options;
+  }
+
+  /// 线路名取标题里「·」后的播放源名（Go 侧在集号重复时追记），
+  /// 默认线路没有后缀，用「线路 N」兜底。
+  String _lineLabel(Episode episode, int ordinal) {
+    final parts = episode.title.split('·');
+    final name = parts.length > 1 ? parts.last.trim() : '';
+    return name.isEmpty ? '线路 ${ordinal + 1}' : name;
+  }
+
   Future<void> _openPanel(PlayerMenuSection section) async {
     if (_panelOpen || _closed) return;
     _interactions.cancel();
@@ -1354,6 +1539,9 @@ class _PlayerScreenState extends State<PlayerScreen>
               preferences: _preferences,
               qualities: _plan?.qualities ?? [],
               actualQuality: _plan?.quality ?? 0,
+              videoWidth: _videoWidth,
+              videoHeight: _videoHeight,
+              lines: _lineOptions,
               local: _plan?.local == true,
               favorite: widget.store.isFavorite(widget.detail.drama.id),
               mobile: _mobile,
@@ -1375,7 +1563,14 @@ class _PlayerScreenState extends State<PlayerScreen>
         ),
       );
       if (mounted && !_closed && index != null && index != _index) {
-        await _play(index);
+        // 同一集换线路（LibreTV 多播放源）：保留当前播放进度；
+        // 换集则按原有逻辑从头开始。
+        final episodes = widget.detail.episodes;
+        final sameEpisode =
+            index < episodes.length &&
+            _index < episodes.length &&
+            episodes[index].number == episodes[_index].number;
+        await _play(index, position: sameEpisode ? _currentPosition : 0);
       }
     } finally {
       if (mounted && !_closed) {
@@ -1516,6 +1711,7 @@ class _PlayerScreenState extends State<PlayerScreen>
     _saveTimer?.cancel();
     _healthTimer?.cancel();
     _errorTimer?.cancel();
+    _firstFrameTimer?.cancel();
     _pictureInPictureExitTimer?.cancel();
     if (_pictureInPictureHandlerInstalled) {
       AppDevice.channel.setMethodCallHandler(null);

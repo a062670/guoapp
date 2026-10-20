@@ -1,4 +1,5 @@
 import 'package:duanju_app/local_store.dart';
+import 'package:duanju_app/playback_preferences.dart';
 import 'package:duanju_app/models.dart';
 import 'package:duanju_app/player_screen.dart';
 import 'package:duanju_app/app_layout.dart';
@@ -252,4 +253,66 @@ void main() {
       debugDefaultTargetPlatformOverride = null;
     }
   });
+
+  testWidgets('sources without quality tiers ignore the global preference', (
+    tester,
+  ) async {
+    final player = ScriptedPlayer();
+    final repository = NoQualityRepository();
+    SharedPreferences.setMockInitialValues({});
+    final store = LocalStore(await SharedPreferences.getInstance());
+    // 全局清晰度偏好是 1080P（比如在红果里选的），本源没有画质档位。
+    await store.setPlaybackPreferences(
+      const PlaybackPreferences(quality: 1080),
+    );
+    final detail = await repository.detail(FixtureRepository.free);
+    await tester.pumpWidget(
+      MaterialApp(
+        theme: ThemeData.dark(),
+        home: PlayerScreen(
+          detail: detail,
+          initialIndex: 0,
+          initialPosition: 7,
+          repository: repository,
+          store: store,
+          playerFactory: () => Player(platformPlayer: player),
+          videoBuilder: (controls) => controls,
+        ),
+      ),
+    );
+    await settleOperations(tester);
+
+    // +117 起控制条有清晰度检测节点标签（1080P/2K/4K 常驻渲染），
+    // 「泄漏全局偏好」的信号是清晰度按钮/菜单 chip 显示 1080P，不是节点文案。
+    expect(
+      find.byKey(const ValueKey('player-quality')),
+      findsOneWidget,
+    );
+    expect(
+      find.descendant(
+        of: find.byKey(const ValueKey('player-quality')),
+        matching: find.text('1080P'),
+      ),
+      findsNothing,
+      reason: '不应把全局偏好泄漏到无画质源',
+    );
+    expect(find.byKey(const ValueKey('menu-quality-1080')), findsNothing);
+    expect(find.text('自动'), findsWidgets);
+    await unmount(tester, player);
+  });
+}
+
+/// plan 无画质档位的仓库（采集源 / 脚本源的形态）。
+class NoQualityRepository extends RouteRepository {
+  @override
+  PlaybackPlan plan(bool alternate) {
+    final plan = super.plan(alternate);
+    return PlaybackPlan(
+      url: plan.url,
+      session: plan.session,
+      routeIndex: plan.routeIndex,
+      routeCount: plan.routeCount,
+      verified: plan.verified,
+    );
+  }
 }

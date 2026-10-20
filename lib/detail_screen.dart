@@ -639,9 +639,23 @@ class _DetailScreenState extends State<DetailScreen> {
     return ((width - 40) / minimum).floor().clamp(1, 12);
   }
 
+  // MacCMS 的 vod_actor / vod_director 用逗号分隔多人，中英文逗号、顿号、
+  // 斜杠都见过（如「张三,李四」「张三，李四」），统一渲染成中文顿号。
+  // 全部切分后为空时回退原文，避免出现「主演：」这种空壳。
+  String _creditText(String raw) {
+    final names = raw
+        .split(RegExp(r'[,，、/]'))
+        .map((name) => name.trim())
+        .where((name) => name.isNotEmpty)
+        .join('、');
+    return names.isEmpty ? raw.trim() : names;
+  }
+
   Widget _overview(Drama drama) {
     final colors = Theme.of(context).colorScheme;
     final meta = [
+      // 评分放在信息行最前面，没有评分的源不会出现占位。
+      if (drama.score.isNotEmpty) '★ ${drama.score}',
       SourceSite.byId(drama.source).name,
       if (drama.episodes > 0) '共 ${drama.episodes} 集',
       if (drama.releaseStatus.isNotEmpty && drama.releaseStatus != 'unknown')
@@ -706,7 +720,8 @@ class _DetailScreenState extends State<DetailScreen> {
         _followingControls(drama),
         if (drama.onlineDate.isNotEmpty ||
             drama.heat.isNotEmpty ||
-            drama.views.isNotEmpty)
+            drama.views.isNotEmpty ||
+            drama.updateTime.isNotEmpty)
           Padding(
             padding: const EdgeInsets.only(top: 10),
             child: Text(
@@ -714,8 +729,41 @@ class _DetailScreenState extends State<DetailScreen> {
                 if (drama.onlineDate.isNotEmpty) '${drama.onlineDate} 上线',
                 if (drama.heat.isNotEmpty) '热度 ${drama.heat}',
                 if (drama.views.isNotEmpty) '播放 ${drama.views}',
+                // vod_time / XML last：源站最后更新时间，只展示不参与排序。
+                if (drama.updateTime.isNotEmpty) '更新于 ${drama.updateTime}',
               ].join(' · '),
               style: TextStyle(color: colors.onSurfaceVariant, fontSize: 12),
+            ),
+          ),
+        if (drama.actor.isNotEmpty || drama.director.isNotEmpty)
+          Padding(
+            padding: const EdgeInsets.only(top: 8),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                if (drama.actor.isNotEmpty)
+                  Text(
+                    '主演：${_creditText(drama.actor)}',
+                    maxLines: 2,
+                    overflow: TextOverflow.ellipsis,
+                    style: TextStyle(
+                      color: colors.onSurfaceVariant,
+                      fontSize: 12,
+                      height: 1.5,
+                    ),
+                  ),
+                if (drama.director.isNotEmpty)
+                  Text(
+                    '导演：${_creditText(drama.director)}',
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: TextStyle(
+                      color: colors.onSurfaceVariant,
+                      fontSize: 12,
+                      height: 1.5,
+                    ),
+                  ),
+              ],
             ),
           ),
         if (drama.tags.isNotEmpty)
@@ -747,6 +795,17 @@ class _DetailScreenState extends State<DetailScreen> {
           ),
         if (drama.description.isNotEmpty) ...[
           const SizedBox(height: 12),
+          // 简介块内注明片源：多片源合并展示时（LibreTV / drpy 收藏后与
+          // 内置源同级），用户需要知道这一部具体来自哪个站源。
+          // 标红处理：片源归属是排查「内容对不上」时的关键信息，需要醒目。
+          Text(
+            '片源：${SourceSite.byId(drama.source).name}',
+            style: TextStyle(
+              color: colors.error,
+              fontWeight: FontWeight.w700,
+            ),
+          ),
+          const SizedBox(height: 4),
           Text(
             drama.description,
             maxLines: _expandedDescription ? null : 3,

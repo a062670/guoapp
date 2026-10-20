@@ -3,8 +3,12 @@ import 'dart:convert';
 import 'dart:io';
 import 'dart:typed_data';
 
+import 'core_bridge.dart';
+import 'drpy.dart';
 import 'lan_sync_models.dart';
+import 'libretv.dart';
 import 'local_store.dart';
+import 'models.dart';
 
 class WebDavRemoteFile {
   const WebDavRemoteFile({required this.name, required this.uri, this.bytes = -1});
@@ -161,21 +165,43 @@ class WebDavSyncOutcome {
     this.updated = 0,
     this.removed = 0,
     this.conflicts = 0,
+    this.sourcePrefs = 0,
+    this.sourceImports = 0,
+    this.warnings = const [],
     this.savedAt,
   });
   final int added;
   final int updated;
   final int removed;
   final int conflicts;
+
+  /// 本次同步发生变化的片源偏好（收藏 / 隐藏）条目数。
+  final int sourcePrefs;
+
+  /// 本次同步从对端自动导入的片源数量。
+  final int sourceImports;
+
+  /// 非致命警告（如个别片源导入失败、粘贴导入的脚本源无法同步）。
+  final List<String> warnings;
   final DateTime? savedAt;
-  String get label => '新增 $added · 更新 $updated · 移除 $removed · 冲突 $conflicts';
-  bool get hasChanges => added + updated + removed > 0;
+  String get label {
+    final base = '新增 $added · 更新 $updated · 移除 $removed · 冲突 $conflicts';
+    final extra = <String>[
+      if (sourcePrefs > 0) '片源偏好 $sourcePrefs 项',
+      if (sourceImports > 0) '导入片源 $sourceImports 个',
+    ];
+    return extra.isEmpty ? base : '$base · ${extra.join(' · ')}';
+  }
+
+  bool get hasChanges =>
+      added + updated + removed + sourcePrefs + sourceImports > 0;
 }
 
 class WebDavSynchronizer {
   WebDavSynchronizer({
     required this.store,
     required this.transport,
+    this.repository,
     DateTime Function()? clock,
   }) : _clock = clock ?? DateTime.now;
 
@@ -183,6 +209,11 @@ class WebDavSynchronizer {
 
   final LocalStore store;
   final WebDavTransport transport;
+
+  /// 片源仓库：同步「片源订阅 + 收藏/隐藏状态」时用来列出已导入源、
+  /// 自动导入对端设备新增的 LibreTV / drpy 源。为空（纯记录同步场景）
+  /// 时跳过订阅收集与自动导入，只同步追剧记录。
+  final AppRepository? repository;
   final DateTime Function() _clock;
 
   Future<WebDavSyncOutcome> synchronize() async {
@@ -209,6 +240,8 @@ class WebDavSynchronizer {
     final remotes = await transport.list(directory);
 
     final remoteRecords = <String, LanRecord>{};
+    final remotePrefs = <String, LanSourcePref>{};
+    final remoteSubs = <String, LanSourceSub>{};
     for (final remote in remotes) {
       if (remote.name == '${document.replica}.json') continue;
       if (remote.bytes > HttpWebDavTransport.fileLimit) continue;
@@ -229,6 +262,20 @@ class WebDavSynchronizer {
         final existing = remoteRecords[entry.key];
         remoteRecords[entry.key] =
             existing == null ? entry.value : existing.merge(entry.value);
+      }
+      // 片源偏好多设备合并：同一源 ID 的对端记录也按最新时间戳归并，
+      // 保证上传前拿到的是「所有对端设备的最新共识」。
+      for (final entry in incoming.sourcePrefs.entries) {
+        final existing = remotePrefs[entry.key];
+        remotePrefs[entry.key] = existing == null
+            ? entry.value
+            : LanSourcePref.merge(existing, entry.value);
+      }
+      for (final entry in incoming.sourceSubs.entries) {
+        final existing = remoteSubs[entry.key];
+        remoteSubs[entry.key] = existing == null
+            ? entry.value
+            : LanSourceSub.merge(existing, entry.value);
       }
     }
 
@@ -255,13 +302,41 @@ class WebDavSynchronizer {
       isCurrent: () => store.profileEpoch == epoch && !store.locked,
     );
 
+    // ---- 片源订阅与收藏 / 隐藏状态 ----
+    final localPrefs = store.sourcePrefsSnapshot();
+    final localSubs = await _collectLocalSubs();
+    final mergedPrefs = <String, LanSourcePref>{
+      for (final id in {...localPrefs.keys, ...remotePrefs.keys})
+        id: remotePrefs[id] == null
+            ? localPrefs[id]!
+            : localPrefs[id] == null
+            ? remotePrefs[id]!
+            : LanSourcePref.merge(localPrefs[id]!, remotePrefs[id]!),
+    };
+    final mergedSubs = <String, LanSourceSub>{
+      for (final id in {...localSubs.keys, ...remoteSubs.keys})
+        id: remoteSubs[id] == null
+            ? localSubs[id]!
+            : localSubs[id] == null
+            ? remoteSubs[id]!
+            : LanSourceSub.merge(localSubs[id]!, remoteSubs[id]!),
+    };
+    final prefsChanged = await store.applySourcePrefs(mergedPrefs);
+    final imports = await _autoImportSubs(mergedSubs);
+
     final savedAt = _clock.call().toUtc();
     try {
       final merged = store.lanDocument;
       final payload = jsonEncode({
         'schema': schema,
         'savedAt': savedAt.toIso8601String(),
-        'document': merged.toJson(),
+        'document': LanDocument(
+          replica: merged.replica,
+          counter: merged.counter,
+          records: merged.records,
+          sourcePrefs: mergedPrefs,
+          sourceSubs: mergedSubs,
+        ).toJson(),
       });
       if (utf8.encode(payload).length > HttpWebDavTransport.fileLimit) {
         throw StateError('同步文件超过 8 MiB 上限，请先清理追剧记录');
@@ -278,8 +353,99 @@ class WebDavSynchronizer {
       updated: count.updated,
       removed: count.removed,
       conflicts: count.conflicts,
+      sourcePrefs: prefsChanged,
+      sourceImports: imports.imported,
+      warnings: imports.warnings,
       savedAt: savedAt,
     );
+  }
+
+  /// 收集本机已导入的 LibreTV / drpy 片源为订阅条目。
+  ///
+  /// 导入时间原生核心不记录，统一按 at=0 处理：对端条目（带同步时间戳）
+  /// 在名称 / 地址上一律更新，本机条目只负责补全并集。drpy 粘贴导入的
+  /// 脚本源没有 scriptUrl、无法跨设备重建，直接跳过。
+  /// repository 为空或核心不支持时返回空表（只同步追剧记录）。
+  Future<Map<String, LanSourceSub>> _collectLocalSubs() async {
+    final repository = this.repository;
+    if (repository == null) return {};
+    final subs = <String, LanSourceSub>{};
+    try {
+      for (final LibreTVSite site in await repository.libretvSites()) {
+        if (site.key.isEmpty || site.api.trim().isEmpty) continue;
+        subs[site.sourceId] = LanSourceSub(name: site.name, api: site.api, at: 0);
+      }
+    } catch (_) {}
+    try {
+      for (final DrpySite script in await repository.drpySites()) {
+        if (script.key.isEmpty || script.scriptUrl.trim().isEmpty) continue;
+        subs[script.sourceId] = LanSourceSub(
+          name: script.name,
+          api: script.scriptUrl,
+          at: 0,
+        );
+      }
+    } catch (_) {}
+    return subs;
+  }
+
+  /// 把对端设备导入、本机还没有的片源自动导入（幂等：已注册的源 ID 跳过）。
+  ///
+  /// 失败仅收集警告、不中断同步——用户确认过「同步时自动导入」策略：
+  /// 个别源失效不应阻塞追剧记录同步。导入成功后刷新 SourceSite 运行时
+  /// 注册表并广播，让新片源立即可用（与启动时 _syncRuntimeSources 同序）。
+  Future<({int imported, List<String> warnings})> _autoImportSubs(
+    Map<String, LanSourceSub> subs,
+  ) async {
+    final repository = this.repository;
+    if (repository == null || subs.isEmpty) {
+      return (imported: 0, warnings: const <String>[]);
+    }
+    final warnings = <String>[];
+    var imported = 0;
+    for (final entry in subs.entries) {
+      final id = entry.key;
+      if (SourceSite.isKnown(id)) continue;
+      final sub = entry.value;
+      final label = sub.name.trim().isEmpty ? id : sub.name.trim();
+      try {
+        if (id.startsWith('libretv:')) {
+          if (sub.api.trim().isEmpty) {
+            warnings.add('片源「$label」缺少采集地址，已跳过');
+            continue;
+          }
+          await repository.libretvImport(sub.api);
+        } else if (id.startsWith('drpy:')) {
+          if (sub.api.trim().isEmpty) {
+            warnings.add('脚本源「$label」为粘贴导入，无法跨设备同步');
+            continue;
+          }
+          await repository.drpyImport(sub.api);
+        } else {
+          continue;
+        }
+        imported++;
+      } catch (failure) {
+        warnings.add('导入片源「$label」失败：$failure');
+      }
+    }
+    if (imported > 0) {
+      try {
+        final sites = await repository.libretvSites();
+        SourceSite.setRuntimeSources([
+          for (final site in sites)
+            if (site.key.isNotEmpty) site.toSourceSite(),
+        ]);
+        final scripts = await repository.drpySites();
+        SourceSite.setRuntimeSources([
+          ...SourceSite.runtimeValues,
+          for (final script in scripts)
+            if (script.key.isNotEmpty) script.toSourceSite(),
+        ]);
+      } catch (_) {}
+      store.notifySourceRegistryChanged();
+    }
+    return (imported: imported, warnings: warnings);
   }
 
   void _record({required DateTime savedAt, String? error}) {

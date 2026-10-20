@@ -89,8 +89,8 @@ func TestHongguoDanmakuCacheAndConcurrentRequests(t *testing.T) {
 			if request.Header.Get("Comment-Source") != "" || request.Header.Get("Server-Channel") != "" {
 				t.Error("comment signatures leaked into the regular player request")
 			}
-			// 普通播放请求必须带齐最小签名集：缺 X-Argus / X-Ladon 时服务端会返回
-			// 200 空 body（2026-10-15 起上线该校验，详见 provider_hongguo_sign.go 注释）。
+			// 普通播放请求必须带齐最小签名集（Gorgon / Khronos / Argus / Ladon），
+			// 缺任一头服务端会返回 200 空 body，表现为取不到播放地址、无法播放。
 			for _, name := range []string{"X-Gorgon", "X-Khronos", "X-Argus", "X-Ladon"} {
 				if request.Header.Get(name) == "" {
 					t.Errorf("regular request missing signature header: %s", name)

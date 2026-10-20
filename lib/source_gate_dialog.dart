@@ -71,10 +71,6 @@ class _SourceGateDialogState extends State<SourceGateDialog> {
     if (mounted) Navigator.pop(context);
   }
 
-  Future<void> _disable() async {
-    await _run(widget.store.disableSourceGate);
-  }
-
   @override
   Widget build(BuildContext context) {
     final store = widget.store;
@@ -90,51 +86,31 @@ class _SourceGateDialogState extends State<SourceGateDialog> {
             mainAxisSize: MainAxisSize.min,
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
-              if (!enabled && gateOff) ...[
+              if (!enabled) ...[
                 Text(
-                  '当前未使用密码，已显示全部站源。'
-                  '${admin ? '可重新设置密码以隐藏敏感站源。' : ''}',
+                  gateOff
+                      ? '当前未使用密码，已显示全部站源。'
+                      : '当前未使用密码，'
+                            '${SourceSite.primaryValues.map((site) => site.name).join('、')}'
+                            ' 之外的站源已隐藏。',
+                ),
+                const SizedBox(height: 8),
+                Text(
+                  admin
+                      ? '无需设置密码：点下方按钮即可隐藏或显示。'
+                            '若需要额外保护，再设置密码锁。'
+                      : '只有管理员用户可以切换隐藏状态或设置密码。',
+                  style: Theme.of(context).textTheme.bodySmall,
                 ),
                 if (admin) ...[
                   const SizedBox(height: 16),
                   TextField(
                     controller: _pin,
-                    autofocus: true,
+                    autofocus: false,
                     obscureText: true,
                     keyboardType: TextInputType.number,
                     decoration: const InputDecoration(
-                      labelText: '设置密码（3 至 12 位数字）',
-                    ),
-                  ),
-                  const SizedBox(height: 12),
-                  TextField(
-                    controller: _confirm,
-                    obscureText: true,
-                    keyboardType: TextInputType.number,
-                    decoration: const InputDecoration(labelText: '再次输入密码'),
-                  ),
-                ] else
-                  const Padding(
-                    padding: EdgeInsets.only(top: 8),
-                    child: Text('只有管理员用户可以设置密码。'),
-                  ),
-              ] else if (!enabled) ...[
-                Text(
-                  '启用后，除'
-                  '${SourceSite.primaryValues.map((site) => site.name).join('、')}'
-                  '外的站源将默认隐藏，输入密码后才显示。',
-                ),
-                const SizedBox(height: 16),
-                if (!admin)
-                  const Text('只有管理员用户可以启用或关闭密码功能。')
-                else ...[
-                  TextField(
-                    controller: _pin,
-                    autofocus: true,
-                    obscureText: true,
-                    keyboardType: TextInputType.number,
-                    decoration: const InputDecoration(
-                      labelText: '设置密码（3 至 12 位数字）',
+                      labelText: '设置密码锁（可选，3 至 12 位数字）',
                     ),
                   ),
                   const SizedBox(height: 12),
@@ -191,14 +167,19 @@ class _SourceGateDialogState extends State<SourceGateDialog> {
                 onPressed: _busy ? null : _unlock,
                 child: Text(_busy ? '正在验证…' : '解锁'),
               ),
-            // 未启用密码时，管理员可直接选择「不使用密码」关闭隐藏、显示全部站源。
-            if (!enabled && !gateOff && admin)
-              TextButton(
-                onPressed: _busy ? null : _disable,
-                child: const Text('不使用密码'),
-              ),
+            // 未启用密码时，管理员一键切换隐藏状态，无需设置密码。
             if (!enabled && admin)
               FilledButton(
+                onPressed: _busy
+                    ? null
+                    // gateOff=true 表示当前显示全部；点它即切回隐藏。
+                    : () => _run(
+                        () => store.setPasswordlessSourceHidden(gateOff),
+                      ),
+                child: Text(gateOff ? '隐藏敏感站源' : '显示全部站源'),
+              ),
+            if (!enabled && admin)
+              TextButton(
                 onPressed: _busy ? null : _enable,
                 child: Text(_busy ? '正在保存…' : '启用密码锁'),
               ),

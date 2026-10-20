@@ -14,13 +14,23 @@ class SourceSite {
       id == 'dsd' ||
       id == 'sorani' ||
       id == 'guipian' ||
-      id == 'hanxiaoquan';
+      id == 'hanxiaoquan' ||
+      isRuntime;
   bool get searchSuggestions => id == 'hongguo';
+
+  /// 运行时导入的 LibreTV 片源（`libretv:<key>`）与 drpy 脚本源
+  /// （`drpy:<key>`），由导入注册。
+  bool get isRuntime => id.startsWith('libretv:') || id.startsWith('drpy:');
   String get groupId => switch (id) {
     'huangguo-video' || 'huangguoai' || 'cloudfront' => 'huangguo',
-    _ => id,
+    _ => isRuntime ? (id.startsWith('drpy:') ? 'drpy' : 'libretv') : id,
   };
-  String get groupName => groupId == 'huangguo' ? '黄果' : name;
+  String get groupName => switch (groupId) {
+    'huangguo' => '黄果',
+    'libretv' => 'LibreTV 片源',
+    'drpy' => 'drpy 脚本源',
+    _ => name,
+  };
   String get entryName => switch (id) {
     'huangguo-video' => '视频',
     'huangguoai' => 'AI',
@@ -53,21 +63,55 @@ class SourceSite {
   ];
   static const knownValues = [...primaryValues, ...restrictedValues];
   static const allValues = [...primaryValues, ...restrictedValues];
-  static const values = allSourcesEnabled ? knownValues : [hongguo];
+
+  /// 运行时注册的 LibreTV 站源（用户导入；进程内有效，重启后由原生核心
+  /// libretv.json 重新拉取注册）。键为完整源 ID「libretv:」+ 站点 key。
+  static final _runtimeSources = <String, SourceSite>{};
+
+  /// 用一份站点列表整体替换运行时注册表（应用启动时同步原生核心、
+  /// 导入 / 删除后刷新界面用）。
+  static void setRuntimeSources(Iterable<SourceSite> sites) {
+    _runtimeSources.clear();
+    for (final site in sites) {
+      if (site.isRuntime) _runtimeSources[site.id] = site;
+    }
+  }
+
+  /// 注销一个运行时站源（删除 LibreTV 片源用）。
+  static void unregisterRuntime(String id) {
+    _runtimeSources.remove(id.trim());
+  }
+
+  /// 当前已注册的运行时站源列表（按 ID 排序，输出稳定）。
+  static List<SourceSite> get runtimeValues {
+    final keys = _runtimeSources.keys.toList()..sort();
+    return [for (final key in keys) _runtimeSources[key]!];
+  }
+
+  /// 运行时 + 内置的全部可见站源。
+  static List<SourceSite> get values => [
+    ...(allSourcesEnabled ? knownValues : [hongguo]),
+    ...runtimeValues,
+  ];
   static bool isAvailable(String id) => values.any((site) => site.id == id);
-  static bool isKnown(String id) => allValues.any((site) => site.id == id);
+  static bool isKnown(String id) =>
+      allValues.any((site) => site.id == id) || _runtimeSources.containsKey(id);
   static bool isPrimary(String id) =>
       primaryValues.any((site) => site.id == id);
   static bool isRestricted(String id) =>
       restrictedValues.any((site) => site.id == id);
 
-  /// 运行时可见站源：未解锁时只保留 [primaryValues]。
+  /// 运行时可见站源：未解锁时保留 [primaryValues] 与用户导入的 LibreTV 片源
+  /// （导入行为即用户授权，不占用敏感站源解锁状态）。
   static List<SourceSite> visibleValues({required bool unlocked}) => [
     for (final site in values)
-      if (unlocked || isPrimary(site.id)) site,
+      if (unlocked || isPrimary(site.id) || site.isRuntime) site,
   ];
-  static SourceSite byId(String id) =>
-      allValues.firstWhere((site) => site.id == id, orElse: () => hongguo);
+  static SourceSite byId(String id) {
+    final runtime = _runtimeSources[id];
+    if (runtime != null) return runtime;
+    return allValues.firstWhere((site) => site.id == id, orElse: () => hongguo);
+  }
 }
 
 class SourceGroup {
@@ -76,14 +120,27 @@ class SourceGroup {
   final String name;
   final List<SourceSite> sources;
 
-  static List<SourceGroup> fromSources(Iterable<SourceSite> sources) {
+  static List<SourceGroup> fromSources(
+    Iterable<SourceSite> sources, {
+    Set<String> favoriteIds = const {},
+  }) {
     final groups = <String, List<SourceSite>>{};
     for (final source in sources) {
-      (groups[source.groupId] ??= []).add(source);
+      // 收藏的运行时片源（libretv:/drpy:）不并入 LibreTV / drpy 大组，
+      // 独占一组、组名即源名，与红果等内置源同级出现在片源选择里。
+      final favorite = favoriteIds.contains(source.id);
+      final groupId = favorite ? source.id : source.groupId;
+      (groups[groupId] ??= []).add(source);
     }
     return [
       for (final group in groups.entries)
-        SourceGroup(group.key, group.value.first.groupName, group.value),
+        SourceGroup(
+          group.key,
+          favoriteIds.contains(group.value.first.id)
+              ? group.value.first.name
+              : group.value.first.groupName,
+          group.value,
+        ),
     ];
   }
 }
@@ -115,11 +172,15 @@ class Drama {
     this.episodes = 0,
     this.category = '',
     bool? vip,
+    this.score = '',
+    this.actor = '',
+    this.director = '',
     this.heat = '',
     this.views = '',
     this.onlineDate = '',
     this.tags = const [],
     this.releaseStatus = '',
+    this.updateTime = '',
   }) : vipStatus = vip;
   final String id;
   final String source;
@@ -131,11 +192,18 @@ class Drama {
   final String category;
   final bool? vipStatus;
   bool get vip => vipStatus == true;
+  final String score;
+  final String actor;
+  final String director;
   final String heat;
   final String views;
   final String onlineDate;
   final List<String> tags;
   final String releaseStatus;
+
+  /// 源站更新时间（MacCMS 的 vod_time / XML 的 last），原始字符串，
+  /// 形如「2026-10-19 20:15」。仅展示用，不参与排序计算。
+  final String updateTime;
   String get releaseLabel => switch (releaseStatus) {
     'finished' || 'completed' => '已完结',
     'ongoing' => '连载中',
@@ -159,10 +227,15 @@ class Drama {
         ? false
         : null,
     heat: json['heat']?.toString() ?? '',
+    // score 在个别源里是数字，统一转字符串；旧备份没有这些键，缺省空串。
+    score: json['score']?.toString() ?? '',
+    actor: json['actor']?.toString() ?? '',
+    director: json['director']?.toString() ?? '',
     views: json['views']?.toString() ?? '',
     onlineDate: json['onlineDate'] as String? ?? '',
     tags: (json['tags'] as List? ?? const []).whereType<String>().toList(),
     releaseStatus: json['releaseStatus'] as String? ?? '',
+    updateTime: json['updateTime'] as String? ?? '',
   );
   Map<String, dynamic> toJson() => {
     'metadataSchema': 1,
@@ -176,10 +249,14 @@ class Drama {
     'category': category,
     'vip': vipStatus,
     'heat': heat,
+    'score': score,
+    'actor': actor,
+    'director': director,
     'views': views,
     'onlineDate': onlineDate,
     'tags': tags,
     'releaseStatus': releaseStatus,
+    'updateTime': updateTime,
   };
 
   Drama merge(Drama fresh) {
@@ -212,6 +289,9 @@ class Drama {
           : fresh.category,
       vip: fresh.vipStatus ?? vipStatus,
       heat: fresh.heat.isEmpty ? heat : fresh.heat,
+      score: fresh.score.isEmpty ? score : fresh.score,
+      actor: fresh.actor.isEmpty ? actor : fresh.actor,
+      director: fresh.director.isEmpty ? director : fresh.director,
       views: fresh.views.isEmpty ? views : fresh.views,
       onlineDate: fresh.onlineDate.isEmpty ? onlineDate : fresh.onlineDate,
       tags: fresh.tags.isEmpty ? tags : fresh.tags,
@@ -219,6 +299,7 @@ class Drama {
           fresh.releaseStatus.isEmpty || fresh.releaseStatus == 'unknown'
           ? releaseStatus
           : fresh.releaseStatus,
+      updateTime: fresh.updateTime.isEmpty ? updateTime : fresh.updateTime,
     );
   }
 }
@@ -294,6 +375,7 @@ class PlaybackPlan {
     this.expiresAt = 0,
     this.routeIndex = 0,
     this.routeCount = 1,
+    this.verified = false,
     this.local = false,
   });
   final String url;
@@ -307,8 +389,15 @@ class PlaybackPlan {
   final int expiresAt;
   final int routeIndex;
   final int routeCount;
+
+  /// 预加载已确认这条线路能取到数据（首字节在预算内）。
+  /// 为真时播放器把首帧等待放宽，减少对"慢但可用"线路的误杀。
+  final bool verified;
   final bool local;
-  bool get hasAlternative => session.isNotEmpty && routeIndex + 1 < routeCount;
+
+  /// 还能不能切到别的线路。线路表按环形处理：最后一条也能回到首选线路，
+  /// 否则记忆停在备用线时失败只能反复重解析同一条线。
+  bool get hasAlternative => session.isNotEmpty && routeCount > 1;
   factory PlaybackPlan.fromJson(Map<String, dynamic> json) => PlaybackPlan(
     url: json['url'] as String? ?? '',
     local: json['local'] == true,
@@ -327,6 +416,7 @@ class PlaybackPlan {
     routeCount: intValue(json['routeCount']) > 0
         ? intValue(json['routeCount'])
         : 1,
+    verified: json['verified'] == true,
   );
 }
 

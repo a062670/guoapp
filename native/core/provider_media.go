@@ -142,6 +142,13 @@ func (d *Downloader) resolveProviderMedia(ctx context.Context, task Task) (provi
 	if chapter.Source == sourceHanxiaoquan {
 		return d.resolveHanxiaoquanMedia(ctx, task)
 	}
+	if site, ok := d.drpySite(chapter.Source); ok {
+		return d.resolveDrpyMedia(ctx, task, site)
+	}
+	// LibreTV：直链直接播；非直链按站源管理里选择的解析方式处理。
+	if site, ok := d.libretvSite(chapter.Source); ok {
+		return d.resolveLibreTVMedia(ctx, task, site)
+	}
 	if strings.HasPrefix(chapter.VideoURL, "hongguo-cenc://") {
 		return d.resolveHongguoMedia(ctx, task)
 	}
@@ -198,8 +205,14 @@ func (d *Downloader) resolveProviderMedia(ctx context.Context, task Task) (provi
 		}
 		media.Referer = pageURL
 	}
+	return d.finishProviderMedia(ctx, media, chapter.Source)
+}
+
+// finishProviderMedia 播放地址收尾：校验 + m3u8 拉播放列表。
+// resolveProviderMedia 与 drpy 等脚本源解析共用此尾部逻辑。
+func (d *Downloader) finishProviderMedia(ctx context.Context, media providerMedia, source string) (providerMedia, error) {
 	if !isProviderHTTPMediaURL(media.URL) {
-		return providerMedia{}, fmt.Errorf("%s 未返回有效播放地址，请刷新章节或确认站点访问权限", chapter.Source)
+		return providerMedia{}, fmt.Errorf("%s 未返回有效播放地址，请刷新章节或确认站点访问权限", source)
 	}
 	parsed, _ := url.Parse(media.URL)
 	if strings.HasSuffix(strings.ToLower(parsed.Path), ".m3u8") {

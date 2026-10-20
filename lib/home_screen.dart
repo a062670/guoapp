@@ -17,7 +17,7 @@ import 'detail_screen.dart';
 import 'playback_launch_screen.dart';
 import 'downloads_screen.dart';
 import 'local_store.dart';
-import 'lan_screen.dart';
+import 'webdav_screen.dart';
 import 'models.dart';
 import 'remote_widgets.dart';
 import 'widgets.dart';
@@ -74,19 +74,53 @@ class _HomeScreenState extends State<HomeScreen> {
   String _sourceSignature = '';
   bool _catalogLoadScheduled = false;
 
+  /// _sourceGroups 的缓存：build 里 AppBar 组选择器、tag 栏 key 等处会
+  /// 多次读取，每次重算 store.sources 过滤 + fromSources 分组。缓存按
+  /// 「可见源 + 收藏集」签名失效，行为与重算完全一致。
+  String _groupsSignature = '';
+  List<SourceGroup> _groupsCache = const [];
+
   List<SourceGroup> get _sourceGroups {
-    final groups = SourceGroup.fromSources(widget.store.sources);
-    return [
-      if (groups.length > 1) SourceGroup('all', '全部站源', widget.store.sources),
-      ...groups,
-    ];
+    final signature =
+        '${widget.store.favoriteSourceIds.join(',')}|'
+        '${widget.store.sources.map((site) => site.id).join(',')}';
+    if (signature != _groupsSignature) {
+      _groupsSignature = signature;
+      // store.sources 已排除被隐藏的运行时片源（与黄果同逻辑）；
+      // favoriteSourceIds 让收藏的片源独占一组，与红果等同级。
+      final groups = SourceGroup.fromSources(
+        widget.store.sources,
+        favoriteIds: widget.store.favoriteSourceIds,
+      );
+      _groupsCache = [
+        if (groups.length > 1) SourceGroup('all', '全部站源', widget.store.sources),
+        ...groups,
+      ];
+    }
+    return _groupsCache;
   }
 
-  SourceGroup get _group =>
-      _sourceGroups
-          .where((group) => group.id == (_allSources ? 'all' : _source.groupId))
-          .firstOrNull ??
-      SourceGroup(_source.groupId, _source.groupName, [_source]);
+  /// 当前选中源对应的分组 id：收藏的运行时片源独占一组（组 id 即源 id，
+  /// 与 SourceGroup.fromSources 的 favoriteIds 一致）；未收藏的按大组 /
+  /// 内置源自身。「全部站源」为特殊组。
+  String get _groupIdOfSource =>
+      _allSources
+      ? 'all'
+      : (widget.store.isFavoriteSource(_source.id)
+            ? _source.id
+            : _source.groupId);
+
+  SourceGroup get _group {
+    final id = _groupIdOfSource;
+    return _sourceGroups.where((group) => group.id == id).firstOrNull ??
+        SourceGroup(
+          id,
+          widget.store.isFavoriteSource(_source.id)
+              ? _source.name
+              : _source.groupName,
+          [_source],
+        );
+  }
   bool get _onlineSearch => _group.sources.any((source) => source.onlineSearch);
   bool get _searchSuggestions =>
       _group.sources.any((source) => source.searchSuggestions);
@@ -884,10 +918,19 @@ class _HomeScreenState extends State<HomeScreen> {
               ] else ...[
                 if (_tab == 1)
                   IconButton(
-                    key: const ValueKey('follow-lan-sync'),
-                    tooltip: '追剧同步',
-                    onPressed: () => openLanSync(context),
-                    icon: const Icon(Icons.sync_rounded),
+                    key: const ValueKey('follow-webdav-sync'),
+                    tooltip: 'WebDAV 同步',
+                    onPressed: () => Navigator.push(
+                      context,
+                      MaterialPageRoute<void>(
+                        builder: (_) => WebDavSyncScreen(
+                          store: widget.store,
+                          repository: widget.repository,
+                          syncOnOpen: true,
+                        ),
+                      ),
+                    ),
+                    icon: const Icon(Icons.cloud_sync_outlined),
                   ),
                 if (_tab == 0) ...[
                   if (!_showRecommendations)
@@ -1237,6 +1280,9 @@ class _HomeScreenState extends State<HomeScreen> {
           category: _displayCategory,
           error: _categoriesError,
           onCategory: _changeCategory,
+          // 标签栏轻拉 = 刷新当前分类目录；重拉 = 打开分类面板
+          // （面板内可排序选择分类）。
+          onRefresh: () => unawaited(_refreshCatalog()),
           onRetry: () => _loadCategories(force: true),
           trailing: Row(
             mainAxisSize: MainAxisSize.min,

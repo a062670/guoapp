@@ -1,0 +1,80 @@
+import 'models.dart';
+
+/// 线路记忆：记住「哪部剧上次是哪条线路播放成功的」。
+///
+/// 目的：避免每次切集都先试一条慢线、等十几秒才切到能播的那条。
+/// 收益点在于它**完全不产生请求**——只是本地把上次成功的 routeIndex
+/// 记下来，下次直接从那条线起播，因此对风控零额外压力。
+///
+/// 失效处理：
+/// - 源站改版会导致线路数变化，取值越界时由 Go 侧回落首选线路；
+/// - 播放失败时调用方要 [forget] 对应剧集，避免一直指向坏线；
+/// - 记忆带 [ttl]（默认 15 分钟）：备用线可能只是「当时可用」，长期锁死在
+///   一条变慢的线上会让用户一直转圈。过期后回到首选线路重新试一次，
+///   多付一次首帧等待，但不额外增加解析请求。
+class PlaybackRouteMemory {
+  PlaybackRouteMemory({
+    this.limit = 200,
+    this.ttl = const Duration(minutes: 15),
+    DateTime Function()? now,
+  }) : _now = now ?? DateTime.now;
+
+  final int limit;
+
+  /// 记忆有效期。刷新恢复 / 重新解析时不必等它过期（调用方显式 forget）。
+  final Duration ttl;
+
+  final DateTime Function() _now;
+  final Map<String, int> _routes = {};
+  final Map<String, DateTime> _rememberedAt = {};
+
+  String _key(String source, String dramaId) => '$source\u0000$dramaId';
+
+  int routeOf(Drama drama) {
+    final key = _key(drama.source, drama.id);
+    final route = _routes[key];
+    if (route == null) return 0;
+    final rememberedAt = _rememberedAt[key];
+    if (rememberedAt == null || _now().difference(rememberedAt) > ttl) {
+      // 过期：按默认线路重新试，同时清掉记录，避免每次判断都再扫一遍。
+      _routes.remove(key);
+      _rememberedAt.remove(key);
+      return 0;
+    }
+    return route;
+  }
+
+  void remember(Drama drama, int route) {
+    final key = _key(drama.source, drama.id);
+    if (route <= 0) {
+      // 0 是默认线路，不需要记。
+      forget(drama);
+      return;
+    }
+    _routes.remove(key);
+    _rememberedAt.remove(key);
+    _routes[key] = route;
+    _rememberedAt[key] = _now();
+    while (_routes.length > limit) {
+      final oldest = _routes.keys.first;
+      _routes.remove(oldest);
+      _rememberedAt.remove(oldest);
+    }
+  }
+
+  void forget(Drama drama) {
+    final key = _key(drama.source, drama.id);
+    _routes.remove(key);
+    _rememberedAt.remove(key);
+  }
+
+  void clear() {
+    _routes.clear();
+    _rememberedAt.clear();
+  }
+
+  int get length => _routes.length;
+}
+
+/// 全进程共享一份记忆：播放页进出、切剧都要保留。
+final PlaybackRouteMemory playbackRouteMemory = PlaybackRouteMemory();

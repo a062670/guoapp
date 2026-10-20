@@ -17,6 +17,22 @@ type nativePreloadKey struct{}
 
 const nativePreloadLimit = 4 << 20
 
+// nativePreloadBudget 预加载的时间预算（两条线路共享，不因切线路而翻倍）。
+const nativePreloadBudget = 6 * time.Second
+
+// nativePreloadFirstByteLimit 首字节（首个分片/播放列表）超过这个时长即判定
+// 「该线路慢/不通」，切下一条再试。判定放在预加载窗口里，是为了让试错不占用
+// 播放窗口——切线路本身是本地操作（nativeNextPlayback 只递增 index），
+// 不产生新的解析请求。
+const nativePreloadFirstByteLimit = 1500 * time.Millisecond
+
+// nativePrefetchResult 一次预取的结果。
+type nativePrefetchResult struct {
+	Bytes       int64
+	FirstByteMS int64
+	OK          bool
+}
+
 func (engine *nativeEngine) nativePreload(ctx context.Context, input nativeInput) (nativePlan, error) {
 	ctx = context.WithValue(ctx, backgroundCatalogKey{}, true)
 	ctx = context.WithValue(ctx, nativePreloadKey{}, true)
@@ -29,9 +45,8 @@ func (engine *nativeEngine) nativePreload(ctx context.Context, input nativeInput
 	stream := engine.stream
 	engine.mu.Unlock()
 	if exists && stream != nil && choice.streamSession != "" {
-		warming, cancel := context.WithTimeout(ctx, 6*time.Second)
-		plan.PrefetchedBytes = stream.nativePrefetch(warming, choice.streamSession, plan.URL, input.Quality)
-		cancel()
+		deadline := time.Now().Add(nativePreloadBudget)
+		plan, _ = engine.nativePreloadWarm(ctx, stream, plan, choice, input.Quality, deadline)
 	}
 	if err := ctx.Err(); err != nil {
 		engine.nativeReleasePlayback(plan.Session)
@@ -40,12 +55,70 @@ func (engine *nativeEngine) nativePreload(ctx context.Context, input nativeInput
 	return plan, nil
 }
 
-func (stream *nativeStreamServer) nativePrefetch(ctx context.Context, token, entry string, quality int) int64 {
+// nativePreloadWarm 预取并按可用性挑选线路。
+//
+// 首选线路若在预算内拿不到首字节（或完全失败），就本地切到下一条线路再探一次；
+// 两次都失败时保留**预取字节更多**的那一版（已有的预取不浪费）。
+// 全程串行、共享同一时间预算，因此请求总量与旧实现相当。
+func (engine *nativeEngine) nativePreloadWarm(
+	ctx context.Context,
+	stream *nativeStreamServer,
+	plan nativePlan,
+	choice nativePlaybackChoice,
+	quality int,
+	deadline time.Time,
+) (nativePlan, nativePlaybackChoice) {
+	remaining := time.Until(deadline)
+	if remaining <= 0 {
+		return plan, choice
+	}
+	warming, cancel := context.WithTimeout(ctx, remaining)
+	result := stream.nativePrefetch(warming, choice.streamSession, plan.URL, quality)
+	cancel()
+	plan.PrefetchedBytes = result.Bytes
+	plan.Verified = result.OK && result.FirstByteMS > 0 && result.FirstByteMS <= nativePreloadFirstByteLimit.Milliseconds()
+	if plan.Verified || choice.index+1 >= len(choice.media) {
+		return plan, choice
+	}
+	if time.Until(deadline) <= 0 {
+		return plan, choice
+	}
+	// 下一条线路：本地切换，零解析请求。
+	previousSession := plan.Session
+	next, err := engine.nativeNextPlayback(ctx, previousSession)
+	if err != nil {
+		return plan, choice
+	}
+	engine.nativeReleasePlayback(previousSession)
+	engine.mu.Lock()
+	nextChoice, exists := engine.playbacks[next.Session]
+	engine.mu.Unlock()
+	if !exists || nextChoice.streamSession == "" {
+		return plan, choice
+	}
+	warming, cancel = context.WithTimeout(ctx, time.Until(deadline))
+	nextResult := stream.nativePrefetch(warming, nextChoice.streamSession, next.URL, quality)
+	cancel()
+	next.PrefetchedBytes = nextResult.Bytes
+	next.Verified = nextResult.OK && nextResult.FirstByteMS > 0 && nextResult.FirstByteMS <= nativePreloadFirstByteLimit.Milliseconds()
+	if !next.Verified && !nextResult.OK && result.OK {
+		// 新的更差：回收，保留原线路（已预取的字节仍然有效）。
+		engine.nativeReleasePlayback(next.Session)
+		return plan, choice
+	}
+	if !next.Verified && result.OK && nextResult.Bytes <= result.Bytes {
+		engine.nativeReleasePlayback(next.Session)
+		return plan, choice
+	}
+	return next, nextChoice
+}
+
+func (stream *nativeStreamServer) nativePrefetch(ctx context.Context, token, entry string, quality int) nativePrefetchResult {
 	stream.mu.Lock()
 	session := stream.sessions[token]
 	stream.mu.Unlock()
 	if session == nil {
-		return 0
+		return nativePrefetchResult{}
 	}
 	ctx, cancel := context.WithCancel(providerMediaContext(ctx, session.credentials))
 	defer cancel()
@@ -53,6 +126,8 @@ func (stream *nativeStreamServer) nativePrefetch(ctx context.Context, token, ent
 	defer stop()
 	remaining, requests := int64(nativePreloadLimit), 0
 	visited := map[string]bool{}
+	started := time.Now()
+	var firstByte time.Duration
 	var warm func(string, int) bool
 	warm = func(local string, depth int) bool {
 		if ctx.Err() != nil || remaining <= 0 || requests >= 8 || depth > 2 || visited[local] {
@@ -113,6 +188,10 @@ func (stream *nativeStreamServer) nativePrefetch(ctx context.Context, token, ent
 				asset.contentType = "application/vnd.apple.mpegurl"
 			}
 			remaining -= int64(len(body))
+			if firstByte <= 0 {
+				// 首个分片/播放列表到手的时间，作为该线路「快不快」的判据。
+				firstByte = time.Since(started)
+			}
 			session.mu.Lock()
 			session.assets[id] = asset
 			session.mu.Unlock()
@@ -158,7 +237,14 @@ func (stream *nativeStreamServer) nativePrefetch(ctx context.Context, token, ent
 		return true
 	}
 	warm(entry, 0)
-	return nativePreloadLimit - remaining
+	fetched := nativePreloadLimit - remaining
+	// 向上取整到毫秒：本机代理下首字节可能不足 1ms，取 0 会被误判成"没测到"。
+	firstMS := int64((firstByte + time.Millisecond - 1) / time.Millisecond)
+	return nativePrefetchResult{
+		Bytes:       fetched,
+		FirstByteMS: firstMS,
+		OK:          fetched > 0,
+	}
 }
 
 var nativeContentRangePattern = regexp.MustCompile(`^bytes ([0-9]+)-([0-9]+)/([0-9]+)$`)

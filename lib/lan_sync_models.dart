@@ -399,15 +399,153 @@ class LanRecord {
   };
 }
 
+/// 运行时片源（`libretv:` / `drpy:`）的收藏 / 隐藏偏好。
+///
+/// 只随 WebDAV 同步传输（局域网同步不携带这两个字段）。合并规则：
+/// [at]（epoch 毫秒）新者整体胜出——取消操作（favorite/hidden 置 false）
+/// 与设置操作一样可传播，不是只增不减的并集；两端同一秒生效时按字段
+/// 取并集，避免同时操作互相覆盖。
+class LanSourcePref {
+  const LanSourcePref({
+    required this.favorite,
+    required this.hidden,
+    required this.at,
+  });
+
+  final bool favorite;
+  final bool hidden;
+  final int at;
+
+  /// 单设备偏好条目数上限（防御畸形同步文件）。
+  static const limit = 500;
+
+  factory LanSourcePref.fromJson(Object? value) {
+    final row = lanMap(value);
+    final favorite = row['favorite'];
+    final hidden = row['hidden'];
+    final at = row['at'];
+    if (row.length > 3 ||
+        favorite is! bool ||
+        hidden is! bool ||
+        at is! int ||
+        at < 0 ||
+        at >= 9007199254740000) {
+      throw const FormatException('片源偏好无效');
+    }
+    return LanSourcePref(favorite: favorite, hidden: hidden, at: at);
+  }
+
+  Map<String, dynamic> toJson() => {
+    'favorite': favorite,
+    'hidden': hidden,
+    'at': at,
+  };
+
+  /// 合并两端偏好：[at] 新者整体胜出（取消可传播）；相同 [at] 按字段取并集。
+  static LanSourcePref merge(LanSourcePref a, LanSourcePref b) {
+    if (a.at == b.at) {
+      return LanSourcePref(
+        favorite: a.favorite || b.favorite,
+        hidden: a.hidden || b.hidden,
+        at: a.at,
+      );
+    }
+    return a.at > b.at ? a : b;
+  }
+}
+
+/// 片源订阅条目：对端设备导入的 LibreTV / drpy 源，供本机同步时自动导入。
+///
+/// [api]：LibreTV 为 provide/vod 采集地址；drpy 为脚本 URL。粘贴导入的
+/// drpy 脚本源没有 URL、无法跨设备重建，收集时直接跳过。
+class LanSourceSub {
+  const LanSourceSub({required this.name, required this.api, required this.at});
+
+  final String name;
+  final String api;
+  final int at;
+
+  /// 单设备订阅条目数上限（防御畸形同步文件）。
+  static const limit = 500;
+
+  factory LanSourceSub.fromJson(Object? value) {
+    final row = lanMap(value);
+    final name = row['name'];
+    final api = row['api'];
+    final at = row['at'];
+    if (row.length > 3 ||
+        name is! String ||
+        api is! String ||
+        at is! int ||
+        at < 0 ||
+        at >= 9007199254740000 ||
+        name.length > 100 ||
+        api.length > 2048) {
+      throw const FormatException('片源订阅无效');
+    }
+    return LanSourceSub(name: name, api: api, at: at);
+  }
+
+  Map<String, dynamic> toJson() => {'name': name, 'api': api, 'at': at};
+
+  /// 按源 ID 求并集后，名称 / 地址取 [at] 较新的一条（并列保留本机条目）。
+  static LanSourceSub merge(LanSourceSub a, LanSourceSub b) =>
+      a.at >= b.at ? a : b;
+}
+
+/// 校验运行时片源 ID（`libretv:` / `drpy:` 前缀 + 64 位以内 key）。
+String lanSourceId(Object? value) {
+  final id = lanText(value, 96);
+  if (!id.startsWith('libretv:') && !id.startsWith('drpy:')) {
+    throw const FormatException('片源身份无效');
+  }
+  return id;
+}
+
+Map<String, LanSourcePref> _lanSourcePrefs(Object? value) {
+  if (value == null) return {};
+  final rows = lanMap(value);
+  if (rows.length > LanSourcePref.limit) {
+    throw const FormatException('片源偏好数量无效');
+  }
+  return {
+    for (final entry in rows.entries)
+      lanSourceId(entry.key): LanSourcePref.fromJson(entry.value),
+  };
+}
+
+Map<String, LanSourceSub> _lanSourceSubs(Object? value) {
+  if (value == null) return {};
+  final rows = lanMap(value);
+  if (rows.length > LanSourceSub.limit) {
+    throw const FormatException('片源订阅数量无效');
+  }
+  return {
+    for (final entry in rows.entries)
+      lanSourceId(entry.key): LanSourceSub.fromJson(entry.value),
+  };
+}
+
 class LanDocument {
   LanDocument({
     required this.replica,
     this.counter = 0,
     Map<String, LanRecord> records = const {},
-  }) : records = Map.of(records);
+    Map<String, LanSourcePref> sourcePrefs = const {},
+    Map<String, LanSourceSub> sourceSubs = const {},
+  }) : records = Map.of(records),
+       sourcePrefs = Map.of(sourcePrefs),
+       sourceSubs = Map.of(sourceSubs);
   final String replica;
   int counter;
   final Map<String, LanRecord> records;
+
+  /// WebDAV 同步专用的片源偏好（收藏 / 隐藏，按 at 最新者胜）。
+  /// 局域网同步不传输、不使用这两个字段。
+  final Map<String, LanSourcePref> sourcePrefs;
+
+  /// WebDAV 同步专用的片源订阅（对端导入的 LibreTV / drpy 源）。
+  final Map<String, LanSourceSub> sourceSubs;
   static const limit = 25000;
   int get conflicts =>
       records.values.fold(0, (count, record) => count + record.conflicts);
@@ -441,11 +579,20 @@ class LanDocument {
         );
       }
     }
+    // sourcePrefs / sourceSubs 为可选字段：旧版文件（局域网同步、历史备份）
+    // 没有这两个键，按空表处理，保证向后兼容。
+    document.sourcePrefs.addAll(_lanSourcePrefs(row['sourcePrefs']));
+    document.sourceSubs.addAll(_lanSourceSubs(row['sourceSubs']));
     return document;
   }
 
-  LanDocument copy() =>
-      LanDocument(replica: replica, counter: counter, records: records);
+  LanDocument copy() => LanDocument(
+    replica: replica,
+    counter: counter,
+    records: records,
+    sourcePrefs: sourcePrefs,
+    sourceSubs: sourceSubs,
+  );
   LanCell cell(Object? value) => LanCell([
     LanValue(LanVersion({replica: ++counter}), value),
   ]);
@@ -541,6 +688,12 @@ class LanDocument {
     'replica': replica,
     'counter': counter,
     'records': records.values.map((record) => record.toJson()).toList(),
+    'sourcePrefs': {
+      for (final entry in sourcePrefs.entries) entry.key: entry.value.toJson(),
+    },
+    'sourceSubs': {
+      for (final entry in sourceSubs.entries) entry.key: entry.value.toJson(),
+    },
   };
 }
 
