@@ -310,7 +310,7 @@ keyPassword=你的密码
 
 ## 开发与构建
 
-Flutter `3.47.4`、Dart `3.12+`、Go `1.24.1+`、Python `3.10+`。Android 需要 JDK 17、SDK 36、NDK `28.2.13676358`；Windows 需要 Visual Studio C++ 桌面组件及 MinGW-w64 x64；iOS 需要 macOS、完整 Xcode 和 CocoaPods。
+Flutter `3.47.4`、Dart `3.12+`、Go `1.24.1+`、Python `3.10+`。Android 需要 JDK 17、SDK 36、NDK `28.2.13676358`；Windows 需要 Visual Studio C++ 桌面组件、MinGW-w64 x64 及 NuGet（`flutter_inappwebview_windows` 构建时用它下载 WebView2）；iOS 需要 macOS、完整 Xcode 和 CocoaPods。
 
 构建脚本对子进程默认设置 `GOPROXY=https://goproxy.cn,direct`、`GOSUMDB=off`，同名环境变量可覆盖。
 
@@ -326,6 +326,8 @@ python3 scripts/build_android.py --cn-mirrors    # 国内镜像
 .\scripts\build_windows.ps1 -AllSources
 .\scripts\build_windows.ps1 -ChinaMirrors
 ~~~
+
+Windows 也可以直接双击 `scripts\build_windows_all_sources.bat` 构建真果鉴：先检查 `py`、`flutter`、`go`、`gcc`、`nuget` 是否在 PATH，完成后打开 `dist\windows`；在命令行运行时可追加 `--cn-mirrors` 等参数。
 
 ~~~sh
 python3 scripts/build_ios.py
