@@ -186,6 +186,21 @@ func (d *Downloader) fetchMediaPlaylist(ctx context.Context, address, referer st
 	}
 	request.Header.Set("Referer", referer)
 	response, err := d.doMediaRequest(request)
+	if err != nil && ctx.Err() == nil {
+		// 部分 CDN 会掐断首次连接（EOF / 握手超时），紧接着重试通常就成功。
+		// 只对传输层错误重试一次；状态码 / 内容异常不重试，避免放大风控。
+		select {
+		case <-time.After(300 * time.Millisecond):
+		case <-ctx.Done():
+			return "", "", ctx.Err()
+		}
+		retry, retryErr := http.NewRequestWithContext(ctx, http.MethodGet, address, nil)
+		if retryErr != nil {
+			return "", "", err
+		}
+		retry.Header.Set("Referer", referer)
+		response, err = d.doMediaRequest(retry)
+	}
 	if err != nil {
 		return "", "", err
 	}

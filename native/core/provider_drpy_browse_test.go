@@ -122,7 +122,7 @@ func importDrpyBrowseEngine(t *testing.T) (*nativeEngine, drpySite, *drpyBrowseF
 		return fixture.server.Client().Do(forwarded)
 	})
 	script := strings.ReplaceAll(drpyBrowseScript, "__HOST__", fixture.server.URL)
-	result, err := engine.importDrpyScript(context.Background(), script)
+	result, err := engine.importDrpyScript(context.Background(), script, "")
 	if err != nil {
 		t.Fatalf("导入脚本失败: %v", err)
 	}

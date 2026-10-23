@@ -40,6 +40,9 @@ class LocalSnapshot {
     'sourceGateHash',
     'forceLogin',
     'webdavSettings',
+    // 源级健康度账本（连续失败 / 平均耗时）。设备本地数据，不带 profile 前缀：
+    // 它描述的是这台机器到各站点的网络状况，与登录哪个用户无关。
+    'sourceHealth',
   };
   final SharedPreferences preferences;
   Map<String, Object> _values = {};

@@ -1,0 +1,7 @@
+{
+  "sites": [
+    {"key":"k1","name":"解析站","type":0,"api":"https://jx.example.com/player/?=&url=","ext":{"flag":["youku","yk","优
+酷","mgtv","芒果"]}},
+    {"key":"m3","name":"采集站三","type":1,"api":"https://api3.example.com/provide/vod/"}
+  ]
+}

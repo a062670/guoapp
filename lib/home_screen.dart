@@ -50,6 +50,15 @@ class _HomeScreenState extends State<HomeScreen> {
   late SourceSite _source;
   bool _allSources = false;
   List<Drama> _items = [];
+
+  /// _items 的版本号：每次内容变化自增，_visible 的缓存据此失效。
+  /// 只用 length 判断不够——同长度的不同内容（比如换页回来）会吃到旧缓存。
+  int _itemsRevision = 0;
+
+  /// _visible 的缓存。构建目录时这个 getter 每帧都会被访问，
+  /// 上千条做一遍「过滤 + 排序」会明显卡顿。
+  List<Drama>? _visibleCache;
+  String _visibleSignature = '';
   bool _loading = true;
   bool _loadingMore = false;
   bool _hasMore = true;
@@ -186,7 +195,10 @@ class _HomeScreenState extends State<HomeScreen> {
       await _updater.update(_group.sources);
       return;
     }
-    await _loadCategories(force: true);
+    // 分类变化极少（站点自己加分类才会有），刷新时按缓存走，不当成
+    // 必须重拉的网络任务——否则一次刷新要跑两轮「全部站源」的请求，
+    // 几十个源时非常慢。真正想重拉分类可以切分组或重启。
+    await _loadCategories();
     if (mounted) await _load(force: true);
   }
 
@@ -205,6 +217,7 @@ class _HomeScreenState extends State<HomeScreen> {
     if (visible.isEmpty) {
       setState(() {
         _items = [];
+        _itemsRevision++;
         _hasMore = false;
         _loading = false;
         _loadingMore = false;
@@ -257,11 +270,15 @@ class _HomeScreenState extends State<HomeScreen> {
         }
         if (!mounted || epoch != widget.store.profileEpoch) return;
         _browser.updateDramas(updates.values);
+        // 站源任务已经改写了磁盘缓存，内存里的旧条目必须作废，否则下面
+        // 的 cacheOnly 重载会跳过回读、继续展示更新前的列表。
+        _browser.invalidateCached(sources);
         setState(() {
           _items = [
             for (final item in _items)
               updates[item.id] == null ? item : item.merge(updates[item.id]!),
           ];
+          _itemsRevision++;
           for (final id in _selectedDramas.keys.toList()) {
             if (updates[id] != null) {
               _selectedDramas[id] = _selectedDramas[id]!.merge(updates[id]!);
@@ -320,6 +337,7 @@ class _HomeScreenState extends State<HomeScreen> {
         _submittedQuery = '';
       }
       _items = [];
+      _itemsRevision++;
       _hasMore = true;
       _error = null;
     });
@@ -461,7 +479,15 @@ class _HomeScreenState extends State<HomeScreen> {
     _source = SourceSite.byId(widget.store.source);
     _allSources = widget.store.catalogView.allSources;
     _sourceSignature = widget.store.sources.map((site) => site.id).join(',');
-    _browser = CatalogBrowser(widget.repository);
+    _browser = CatalogBrowser(
+      widget.repository,
+      health: widget.store.sourceHealth,
+      onHealth: (source, ok, elapsedMs) => widget.store.noteSourceHealth(
+        source,
+        ok: ok,
+        elapsedMs: elapsedMs,
+      ),
+    );
     _updater = LibraryUpdater(
       widget.repository,
       widget.store,
@@ -534,6 +560,7 @@ class _HomeScreenState extends State<HomeScreen> {
         for (final item in _items)
           item.id == drama.id ? item.merge(drama) : item,
       ];
+      _itemsRevision++;
     });
     unawaited(saveUserChange(context, () => widget.store.refreshDrama(drama)));
   }
@@ -564,6 +591,7 @@ class _HomeScreenState extends State<HomeScreen> {
       if (!mounted || generation != _generation) return;
       setState(() {
         _items = result.items;
+        _itemsRevision++;
         _hasMore = result.hasMore;
         _submittedQuery = query;
         _loading = cached && !result.fresh;
@@ -585,6 +613,22 @@ class _HomeScreenState extends State<HomeScreen> {
         force: force,
         cacheOnly: cacheOnly,
         onCached: (result) => accept(result, cached: true),
+        onPartial: (result) {
+          // 流式刷新：某个源先回来了就先把它渲染出来，其余源陆续补齐。
+          //
+          // 这里**只更新列表、不写库**——accept() 里的 refreshDramas 会做
+          // 一次全量序列化（实测百毫秒级），每批数据都调一次会让 UI 再次卡住。
+          // 最终结果仍由下面的 accept() 统一写库。
+          if (!mounted || generation != _generation) return;
+          if (result.items.isEmpty) return;
+          setState(() {
+            _items = result.items;
+            _itemsRevision++;
+            _hasMore = result.hasMore;
+            _loading = true;
+            _loadingMore = false;
+          });
+        },
       );
       accept(result);
     } catch (error) {
@@ -610,6 +654,7 @@ class _HomeScreenState extends State<HomeScreen> {
       _source = source;
       _allSources = allSources;
       _items = [];
+      _itemsRevision++;
       _hasMore = true;
       _submittedQuery = '';
       _error = null;
@@ -824,9 +869,25 @@ class _HomeScreenState extends State<HomeScreen> {
       _group.sources.any((source) => source.id == 'huangdou');
   bool get _hideVip => _supportsVipFilter && widget.store.hideVip;
 
+  /// 当前要展示的条目（过滤 + 排序）。
+  ///
+  /// 带缓存：这个 getter 在每次 rebuild 时都会被访问，而「全部站源」可能有
+  /// 上千条——每帧做一遍「allowsSource 逐条判断 + 搜索匹配 + 排序」会明显
+  /// 卡顿（点按钮后半天才出画面）。缓存签名覆盖所有影响结果的输入：
+  /// 条目版本、搜索词、分类、排序视图、VIP 过滤、以及站源可见性相关的
+  /// store 状态。
   List<Drama> get _visible {
+    final view = widget.store.catalogView;
     final query = _search.text.trim().toLowerCase();
-    return sortCatalog(
+    // 可见站源列表本身就编码了「隐藏 / 解锁 / 用户权限」——直接拿它做
+    // 签名的一部分，比单独猜某个计数更可靠（隐藏操作不会改变长度）。
+    final sourceIds = widget.store.sources.map((site) => site.id).join(',');
+    final signature =
+        '$_itemsRevision|$query|$_category|${view.sort.name}|${view.release}|'
+        '$_hideVip|$_onlineSearch|$sourceIds';
+    final cached = _visibleCache;
+    if (cached != null && signature == _visibleSignature) return cached;
+    final result = sortCatalog(
       _items.where((drama) {
         if (!widget.store.allowsSource(drama.source)) return false;
         if (_category.startsWith('local:') &&
@@ -840,8 +901,11 @@ class _HomeScreenState extends State<HomeScreen> {
             query.isEmpty ||
             matchesDramaQuery(drama, query);
       }),
-      widget.store.catalogView,
+      view,
     );
+    _visibleCache = result;
+    _visibleSignature = signature;
+    return result;
   }
 
   @override

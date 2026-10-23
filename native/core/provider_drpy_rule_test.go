@@ -85,7 +85,7 @@ func TestDrpyRuleBrowse(t *testing.T) {
 	fixture := newDrpyRuleFixture(t)
 	engine := drpyFixtureEngine(t, fixture)
 	script := strings.ReplaceAll(drpyRuleScript, "__HOST__", fixture.server.URL)
-	result, err := engine.importDrpyScript(context.Background(), script)
+	result, err := engine.importDrpyScript(context.Background(), script, "")
 	if err != nil {
 		t.Fatalf("导入失败: %v", err)
 	}
@@ -146,7 +146,7 @@ func TestDrpyRulePlayFallsBackToEpisodeURL(t *testing.T) {
 	fixture := newDrpyRuleFixture(t)
 	engine := drpyFixtureEngine(t, fixture)
 	script := strings.ReplaceAll(drpyRuleScript, "__HOST__", fixture.server.URL)
-	result, err := engine.importDrpyScript(context.Background(), script)
+	result, err := engine.importDrpyScript(context.Background(), script, "")
 	if err != nil {
 		t.Fatalf("导入失败: %v", err)
 	}
@@ -246,7 +246,7 @@ func TestDrpyRuleHTMLResponseHint(t *testing.T) {
 	})
 	engine := drpyFixtureEngine(t, fixture)
 	script := strings.ReplaceAll(drpyRuleScript, "__HOST__", fixture.server.URL)
-	result, err := engine.importDrpyScript(context.Background(), script)
+	result, err := engine.importDrpyScript(context.Background(), script, "")
 	if err != nil {
 		t.Fatalf("导入失败: %v", err)
 	}

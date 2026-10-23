@@ -178,6 +178,9 @@ class _SourcesScreenState extends State<SourcesScreen> {
       }
     });
     try {
+      // 手动操作就是「我现在就要试这个源」——先清掉健康度里的连续失败记录，
+      // 否则首页的「冷却跳过」会让刚修好的源继续被忽略。
+      if (operation != 'cancel') widget.store.forgetSourceHealth(source.id);
       final status = operation == 'cancel'
           ? await widget.repository.cancelSourceJob(source.id)
           : await widget.repository.startSourceJob(
@@ -384,7 +387,15 @@ class _SourcesScreenState extends State<SourcesScreen> {
             for (final site in sites)
               ListTile(
                 contentPadding: EdgeInsets.zero,
-                leading: const Icon(Icons.subscriptions_outlined),
+                leading: site.isRule
+                    // 规则型 Spider（XBPQ / 海阔 / Bili）：用规则图标并在
+                    // tooltip 里说明数据由本地解释器抓取，避免用户误以为
+                    // 还需要 jar 包或 Java 环境。
+                    ? Tooltip(
+                        message: site.engineHint,
+                        child: const Icon(Icons.rule),
+                      )
+                    : const Icon(Icons.subscriptions_outlined),
                 title: Text(site.name),
                 subtitle: Text(
                   '${site.api}\n${site.typeLabel} · ${site.count} 部',
@@ -526,13 +537,17 @@ class _SourcesScreenState extends State<SourcesScreen> {
   }
 
   Future<void> _importLibreTV() async {
-    final input = await showDialog<String>(
+    final dialogResult = await showDialog<_ImportInput>(
       context: context,
       builder: (_) => const _LibreTVImportDialog(),
     );
-    if (input == null || input.isEmpty) return;
+    if (dialogResult == null) return;
+    final input = dialogResult.text;
+    if (input.isEmpty) return;
     if (_looksLikeDrpyInput(input)) {
-      await _importDrpy(input);
+      // 粘贴脚本文本时可附带「来源链接」：记下来源，WebDAV 同步才能
+      // 在对端按地址重建这个脚本源（脚本正文没有地址，只能跳过）。
+      await _importDrpy(input, sourceUrl: dialogResult.sourceUrl);
       return;
     }
     setState(() => _libretvBusy = true);
@@ -556,7 +571,11 @@ class _SourcesScreenState extends State<SourcesScreen> {
       });
       widget.store.notifySourceRegistryChanged();
       final skipped = result.skipped;
+      final ruleCount = result.added.where((site) => site.isRule).length;
       final summary = StringBuffer('新增 ${result.added.length} 个片源');
+      if (ruleCount > 0) {
+        summary.write('（含 $ruleCount 个规则源）');
+      }
       summary.write(' · 已验证 ${result.verified} 个');
       if (result.parses.isNotEmpty) {
         summary.write(' · ${result.parses.length} 种解析方式');
@@ -658,9 +677,9 @@ class _SourcesScreenState extends State<SourcesScreen> {
 
   /// 导入 drpy 脚本源：导入成功即刷新列表与运行时注册表。
   /// 失败时吞掉异常仅弹提示（保持旧行为）。
-  Future<void> _importDrpy(String script) async {
+  Future<void> _importDrpy(String script, {String sourceUrl = ''}) async {
     try {
-      await _importDrpyOrThrow(script);
+      await _importDrpyOrThrow(script, sourceUrl: sourceUrl);
     } catch (error) {
       if (mounted) {
         setState(() => _libretvBusy = false);
@@ -672,10 +691,13 @@ class _SourcesScreenState extends State<SourcesScreen> {
   }
 
   /// drpy 导入核心：成功返回，失败抛出（供候选对话框感知逐条结果）。
-  Future<void> _importDrpyOrThrow(String script) async {
+  Future<void> _importDrpyOrThrow(String script, {String sourceUrl = ''}) async {
     setState(() => _libretvBusy = true);
     try {
-      final result = await widget.repository.drpyImport(script);
+      final result = await widget.repository.drpyImportWithSource(
+        script,
+        sourceUrl,
+      );
       if (!mounted) return;
       final site = DrpySite(
         key: result.key,
@@ -696,9 +718,15 @@ class _SourcesScreenState extends State<SourcesScreen> {
         _libretvBusy = false;
       });
       widget.store.notifySourceRegistryChanged();
-      ScaffoldMessenger.of(
-        context,
-      ).showSnackBar(SnackBar(content: Text('已导入脚本源「${result.name}」')));
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(
+            sourceUrl.trim().isEmpty
+                ? '已导入脚本源「${result.name}」（未记录来源链接，跨设备同步会跳过）'
+                : '已导入脚本源「${result.name}」',
+          ),
+        ),
+      );
       try {
         final scripts = await widget.repository.drpySites();
         if (!mounted) return;
@@ -1102,45 +1130,91 @@ class _LibreTVImportDialog extends StatefulWidget {
 
 class _LibreTVImportDialogState extends State<_LibreTVImportDialog> {
   final _controller = TextEditingController();
+  final _sourceController = TextEditingController();
 
   @override
   void dispose() {
     _controller.dispose();
+    _sourceController.dispose();
     super.dispose();
   }
 
   @override
-  Widget build(BuildContext context) => AlertDialog(
-    title: const Text('导入 LibreTV 片源 / drpy 脚本'),
-    content: TextField(
-      controller: _controller,
-      maxLines: 6,
-      autofocus: true,
-      decoration: const InputDecoration(
-        labelText: '片源链接 / 配置 JSON / Base58 订阅 / 采集地址 / drpy 脚本',
-        hintText:
-            'https://example.com/libretv/config.json\n'
-            '或 {"sites":[{"key":"a","name":"A","type":1,'
-            '"api":"https://example.com/provide/vod"}]}\n'
-            '或 LunaTV-config 导出的 Base58 订阅（format=2 / format=3）\n'
-            '或 https://example.com/api.php/provide/vod/at/xml/\n'
-            '或含 var rule 的 drpy 脚本（JS 原文或 .js 地址）\n'
-            '或 CatVod 蜘蛛的 .js 地址（如 ./cat/xxx_open.js，需填完整地址）',
-        border: OutlineInputBorder(),
+  Widget build(BuildContext context) {
+    // 粘贴脚本文本时才需要「来源链接」：跨设备同步按该地址重建脚本源。
+    final showSource = _looksLikeScriptText(_controller.text);
+    return AlertDialog(
+      title: const Text('导入 LibreTV 片源 / drpy 脚本'),
+      content: SingleChildScrollView(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            TextField(
+              controller: _controller,
+              maxLines: 6,
+              autofocus: true,
+              onChanged: (_) => setState(() {}),
+              decoration: const InputDecoration(
+                labelText: '片源链接 / 配置 JSON / Base58 订阅 / 采集地址 / drpy 脚本',
+                hintText:
+                    'https://example.com/libretv/config.json\n'
+                    '或 {"sites":[{"key":"a","name":"A","type":1,'
+                    '"api":"https://example.com/provide/vod"}]}\n'
+                    '或 LunaTV-config 导出的 Base58 订阅（format=2 / format=3）\n'
+                    '或 https://example.com/api.php/provide/vod/at/xml/\n'
+                    '或含 var rule 的 drpy 脚本（JS 原文或 .js 地址）\n'
+                    '或 CatVod 蜘蛛的 .js 地址（如 ./cat/xxx_open.js，需填完整地址）\n'
+                    '订阅里的 csp_XBPQ / csp_XYQHiker / csp_Bili 规则源会自动导入',
+                border: OutlineInputBorder(),
+              ),
+            ),
+            if (showSource) ...[
+              const SizedBox(height: 12),
+              TextField(
+                controller: _sourceController,
+                decoration: const InputDecoration(
+                  labelText: '脚本来源链接（可选）',
+                  hintText: 'https://example.com/xxx.js',
+                  helperText: '粘贴脚本正文时填写：用于跨设备同步（WebDAV）按地址重建',
+                  helperMaxLines: 2,
+                  border: OutlineInputBorder(),
+                ),
+              ),
+            ],
+          ],
+        ),
       ),
-    ),
-    actions: [
-      TextButton(
-        onPressed: () => Navigator.pop(context),
-        child: const Text('取消'),
-      ),
-      FilledButton(
-        onPressed: () => Navigator.pop(context, _controller.text.trim()),
-        child: const Text('导入'),
-      ),
-    ],
-  );
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.pop(context),
+          child: const Text('取消'),
+        ),
+        FilledButton(
+          onPressed: () => Navigator.pop(
+            context,
+            _ImportInput(_controller.text.trim(), _sourceController.text.trim()),
+          ),
+          child: const Text('导入'),
+        ),
+      ],
+    );
+  }
 }
+
+/// 片源导入对话框的返回值：输入文本 + 可选的脚本来源链接。
+///
+/// 来源链接只对「粘贴 drpy 脚本文本」有意义：脚本文本没有地址，
+/// WebDAV 同步无法在对端重建；记下来源后可按地址重新拉取。
+class _ImportInput {
+  const _ImportInput(this.text, this.sourceUrl);
+
+  final String text;
+  final String sourceUrl;
+}
+
+/// 输入看起来是 drpy 脚本正文（而非链接 / 订阅 JSON）。
+bool _looksLikeScriptText(String input) =>
+    RegExp(r'\b(?:var|let|const)\s+rule\b').hasMatch(input.trim());
 
 /// 混合订阅里发现的 drpy 脚本候选确认框。
 /// 脚本不会自动导入（需用户确认），这里提供逐个导入与全部导入。
@@ -1181,16 +1255,26 @@ class _DrpyCandidatesDialogState extends State<_DrpyCandidatesDialog> {
       if (!mounted) return;
       setState(() {
         _busy = false;
-        _error = '「${candidate.name}」导入失败：$error';
+        _error = candidate.relative
+            ? '「${candidate.name}」导入失败：$error\n'
+                '该脚本地址是相对路径，按订阅地址补全后仍取不到——'
+                '聚合订阅常丢失原始路径，请改用该源的原始订阅地址导入。'
+            : '「${candidate.name}」导入失败：$error';
       });
     }
   }
 
+  /// 脚本地址原本是相对路径（按订阅地址补全而来）的候选数量。
+  int get relativeCount =>
+      widget.candidates.where((candidate) => candidate.relative).length;
+
+  /// 全部导入：**失败的不中断**，跳过去继续下一个，最后汇总失败项。
   Future<void> _importAll() async {
     setState(() {
       _busy = true;
       _error = null;
     });
+    final failed = <String>[];
     for (final candidate in widget.candidates) {
       if (_imported.contains(candidate.api)) continue;
       try {
@@ -1199,15 +1283,23 @@ class _DrpyCandidatesDialogState extends State<_DrpyCandidatesDialog> {
         setState(() => _imported.add(candidate.api));
       } catch (error) {
         if (!mounted) return;
-        setState(() {
-          _busy = false;
-          _error = '「${candidate.name}」导入失败：$error';
-        });
-        return;
+        // 失败不中断：聚合订阅里常混着一批取不到的脚本（相对路径补全后
+        // 404），一头撞上就停的话，后面能用的脚本永远轮不到。
+        failed.add(
+          candidate.relative
+              ? '${candidate.name}：$error（相对路径，聚合订阅丢失原始路径）'
+              : '${candidate.name}：$error',
+        );
+        setState(() {});
       }
     }
     if (!mounted) return;
-    setState(() => _busy = false);
+    setState(() {
+      _busy = false;
+      if (failed.isNotEmpty) {
+        _error = '${failed.length} 个导入失败：\n${failed.join('\n')}';
+      }
+    });
   }
 
   @override
@@ -1227,6 +1319,21 @@ class _DrpyCandidatesDialogState extends State<_DrpyCandidatesDialog> {
               '订阅中包含 ${widget.candidates.length} 个 drpy 脚本'
               '（type≥3），需要确认后才会导入。',
             ),
+            // 相对路径补全的候选：多源聚合订阅常见，导入必然 404。
+            // 提前说清楚，免得用户点一圈才发现全失败。
+            if (relativeCount > 0) ...[
+              const SizedBox(height: 8),
+              Text(
+                '其中 $relativeCount 个脚本地址是相对路径（已按订阅地址补全）。'
+                '多源聚合订阅常把各家的配置合并却不改写相对路径，'
+                '这类脚本大概率取不到（原版 TVBox 同样如此），'
+                '建议改用该源的原始订阅地址导入。',
+                style: TextStyle(
+                  color: Theme.of(context).colorScheme.error,
+                  fontSize: 12,
+                ),
+              ),
+            ],
             if (_error != null) ...[
               const SizedBox(height: 8),
               Text(
@@ -1255,11 +1362,29 @@ class _DrpyCandidatesDialogState extends State<_DrpyCandidatesDialog> {
                       maxLines: 1,
                       overflow: TextOverflow.ellipsis,
                     ),
-                    subtitle: Text(
-                      candidate.api,
-                      maxLines: 1,
-                      overflow: TextOverflow.ellipsis,
-                    ),
+                    subtitle: candidate.relative
+                        ? Row(
+                            children: [
+                              Icon(
+                                Icons.warning_amber_rounded,
+                                size: 14,
+                                color: Theme.of(context).colorScheme.error,
+                              ),
+                              const SizedBox(width: 4),
+                              Expanded(
+                                child: Text(
+                                  '${candidate.api}（相对路径补全，可能取不到）',
+                                  maxLines: 1,
+                                  overflow: TextOverflow.ellipsis,
+                                ),
+                              ),
+                            ],
+                          )
+                        : Text(
+                            candidate.api,
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                          ),
                     trailing: done
                         ? const Text('已导入')
                         : TextButton(

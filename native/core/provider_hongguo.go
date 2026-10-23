@@ -198,25 +198,49 @@ func (d *Downloader) resolveHongguoMedia(ctx context.Context, task Task) (provid
 	if !hongguoNumericID.MatchString(videoID) || !hongguoNumericID.MatchString(seriesID) {
 		return providerMedia{}, fmt.Errorf("红果章节 ID 无效，请重新获取章节")
 	}
-	media, nativeErr := d.resolveHongguoAppMedia(ctx, videoID)
-	if nativeErr == nil {
-		return media, nil
+	// 健康度跨进程保留：首次进入时加载，退出前回写（仅在状态变化时才真正落盘）。
+	// 否则每次冷启动都会从第一条线路重新白试一轮。
+	hongguoRoutesHealth.loadFrom(d.cfg.dataDir)
+	defer hongguoRoutesHealth.saveTo(d.cfg.dataDir)
+
+	// 按注册表顺序逐条尝试（详见 provider_hongguo_routes.go）：
+	// drpys 两段式 → App video_model 单段 → 网页 → djapi 备用，顺序与改造前一致。
+	//
+	// 每条线路的成功/失败都会记账（noteOK / noteFail），连续失败达阈值后
+	// 冷却期内直接跳过——不再每次都先白试一次。记账只消费既有请求的结果，
+	// 不额外发起探测请求。
+	errs := make(map[string]error, len(hongguoRoutes))
+	for _, route := range hongguoRoutes {
+		if hongguoRoutesHealth.skip(route.Name, time.Now()) {
+			errs[route.Name] = errHongguoRouteSkipped
+			continue
+		}
+		media, err := route.Resolve(ctx, d, seriesID, videoID)
+		if err == nil && strings.TrimSpace(media.URL) == "" {
+			// 线路「返回成功但没有播放地址」一律按失败处理并继续回退
+			err = errHongguoRouteEmptyMedia
+		}
+		if err == nil {
+			hongguoRoutesHealth.noteOK(route.Name)
+			// 带上来源线路：播放层探活失败时可据此把失败回流给线路健康度
+			media.Route = route.Name
+			for index := range media.Variants {
+				media.Variants[index].Route = route.Name
+			}
+			return media, nil
+		}
+		hongguoRoutesHealth.noteFail(route.Name, time.Now(), hongguoClassifyFailure(err))
+		errs[route.Name] = err
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return providerMedia{}, ctxErr
+		}
 	}
-	if err := ctx.Err(); err != nil {
-		return providerMedia{}, err
-	}
-	media, pageErr := d.resolveHongguoWebMedia(ctx, seriesID, videoID)
-	if pageErr == nil {
-		return media, nil
-	}
-	if err := ctx.Err(); err != nil {
-		return providerMedia{}, err
-	}
-	media, apiErr := d.resolveHongguoPlaybackAPI(ctx, seriesID, videoID)
-	if apiErr == nil {
-		return media, nil
-	}
-	return providerMedia{}, fmt.Errorf("红果 App 取流失败：%v；网页取流失败：%v；备用取流失败：%w", publicError(nativeErr), publicError(pageErr), apiErr)
+	// 聚合错误沿用改造前的三段文案（App / 网页 / 备用），
+	// 保证既有日志与排查习惯不受本次改造影响。
+	return providerMedia{}, fmt.Errorf("红果 App 取流失败：%v；网页取流失败：%v；备用取流失败：%w",
+		publicError(routeErrorOrSkip(errs[hongguoRouteApp])),
+		publicError(routeErrorOrSkip(errs[hongguoRouteWeb])),
+		routeErrorOrSkip(errs[hongguoRouteDjapi]))
 }
 
 func (d *Downloader) resolveHongguoWebMedia(ctx context.Context, seriesID, videoID string) (providerMedia, error) {

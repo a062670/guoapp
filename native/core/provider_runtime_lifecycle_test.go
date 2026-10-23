@@ -190,7 +190,7 @@ func importRuntimeSource(t *testing.T, engine *nativeEngine, kind, address strin
 		}
 		return sourceLibreTVPrefix + added[0]["key"].(string)
 	default:
-		result, err := engine.importDrpyScript(context.Background(), address)
+		result, err := engine.importDrpyScript(context.Background(), address, "")
 		if err != nil {
 			t.Fatalf("导入脚本失败: %v", err)
 		}
@@ -374,7 +374,7 @@ func TestMixedSubscriptionCandidateImportThenBrowse(t *testing.T) {
 		t.Fatalf("候选地址未按订阅地址补全: %q", address)
 	}
 
-	imported, err := engine.importDrpyScript(context.Background(), address)
+	imported, err := engine.importDrpyScript(context.Background(), address, "")
 	if err != nil {
 		t.Fatalf("候选导入失败: %v", err)
 	}

@@ -134,7 +134,7 @@ func (engine *nativeEngine) saveCoverAddress(id, address string) {
 		}
 	}
 	if changed {
-		engine.writeCatalogDiskLocked()
+		engine.commitCatalogDiskLocked()
 	}
 }
 

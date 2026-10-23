@@ -136,7 +136,7 @@ func TestDrpyReqFailurePropagates(t *testing.T) {
 		return nil, errors.New("fixture network down")
 	})
 	script := strings.ReplaceAll(drpyBrowseScript, "__HOST__", "http://unreachable.test")
-	if _, err := engine.importDrpyScript(context.Background(), script); err != nil {
+	if _, err := engine.importDrpyScript(context.Background(), script, ""); err != nil {
 		t.Fatalf("导入失败: %v", err)
 	}
 	site, ok := engine.downloader.drpySite(drpySourceID(""))

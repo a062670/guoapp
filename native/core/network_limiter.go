@@ -77,8 +77,15 @@ func (d *Downloader) catalogResponseError(request *http.Request, response *http.
 }
 
 type requestLimiter struct {
-	concurrency        int
+	// concurrency 内置源（红果 / 黄果 / 野果…）的全局并发上限。
+	// 沿用原作者的值，不要为了「快」去动它——那些源有账号与反爬风控。
+	concurrency int
+	// externalConcurrency 第三方源（用户导入的 libretv / drpy / 规则源）
+	// 的全局并发上限。这些是几十个互不相干的小站，各请求一次。
+	externalConcurrency int
+	// active / activeExternal 分别统计两类源当前在飞的数量。
 	active             int
+	activeExternal     int
 	foregroundWaiting  int
 	lastForeground     time.Time
 	interval           time.Duration
@@ -92,10 +99,34 @@ type requestLimiter struct {
 type backgroundCatalogKey struct{}
 
 func newRequestLimiter(concurrency int, interval time.Duration) *requestLimiter {
+	return newRequestLimiterWithExternal(concurrency, concurrency, interval)
+}
+
+// newRequestLimiterWithExternal 内置源与第三方源使用不同的全局并发上限。
+//
+// 为什么要分开：`concurrency` 是原作者为**内置源**（红果 / 黄果 / 野果等）
+// 定的保守值，那些站点有反爬与账号风控，并发必须压住。用户导入的
+// libretv / drpy / 规则源是几十个**互不相干**的第三方小站，各请求一次，
+// 沿用同一个全局上限就变成排队（表现：点开「全部站源」半天不出内容）。
+//
+// 两者仍然共享：同一 host 串行（gate.busy）+ 同 host 请求间隔 interval，
+// 所以放宽的只是「不同站点之间」的并行度，单个站点不会被打爆。
+func newRequestLimiterWithExternal(concurrency, externalConcurrency int, interval time.Duration) *requestLimiter {
 	if concurrency < 1 {
 		concurrency = 1
 	}
-	return &requestLimiter{concurrency: concurrency, interval: interval, gates: map[string]*requestGate{}, backoffs: map[string]*requestBackoff{}, backgroundBackoffs: map[string]*requestBackoff{}, changed: make(chan struct{})}
+	if externalConcurrency < 1 {
+		externalConcurrency = concurrency
+	}
+	return &requestLimiter{
+		concurrency:         concurrency,
+		externalConcurrency: externalConcurrency,
+		interval:            interval,
+		gates:               map[string]*requestGate{},
+		backoffs:            map[string]*requestBackoff{},
+		backgroundBackoffs:  map[string]*requestBackoff{},
+		changed:             make(chan struct{}),
+	}
 }
 
 func (limiter *requestLimiter) notifyLocked() {
@@ -107,10 +138,14 @@ func (limiter *requestLimiter) acquire(ctx context.Context, request *http.Reques
 	background, _ := ctx.Value(backgroundCatalogKey{}).(bool)
 	host := strings.ToLower(request.URL.Hostname())
 	source := providerSourceForURL(request.URL.String())
+	// builtin = 内置源（红果 / 黄果 / 野果…），沿用原作者的保守并发；
+	// 其余是用户导入的第三方源，走更宽松的上限。
+	builtin := source != ""
 	if source == "" {
 		source = host
 		if strings.HasSuffix(host, ".cloudfront.net") {
 			source = "cloudfront"
+			builtin = true // 内置源的 CDN，同样保守对待
 		}
 	}
 	limiter.mu.Lock()
@@ -149,11 +184,24 @@ func (limiter *requestLimiter) acquire(ctx context.Context, request *http.Reques
 				delay = idleDelay
 			}
 		}
-		lowPriorityReady := !background || limiter.foregroundWaiting == 0 && limiter.active == 0
-		if lowPriorityReady && !gate.busy && limiter.active < limiter.concurrency && delay <= 0 {
+		// 内置源与第三方源分别计数：内置源沿用原作者的保守上限（风控），
+		// 第三方源用更大的上限（几十个不同小站各请求一次，不该排队）。
+		limit := limiter.concurrency
+		active := limiter.active
+		if !builtin {
+			limit = limiter.externalConcurrency
+			active = limiter.activeExternal
+		}
+		lowPriorityReady := !background ||
+			limiter.foregroundWaiting == 0 && limiter.active == 0 && limiter.activeExternal == 0
+		if lowPriorityReady && !gate.busy && active < limit && delay <= 0 {
 			gate.busy = true
 			gate.lastStart = time.Now()
-			limiter.active++
+			if builtin {
+				limiter.active++
+			} else {
+				limiter.activeExternal++
+			}
 			limiter.mu.Unlock()
 			break
 		}
@@ -178,7 +226,11 @@ func (limiter *requestLimiter) acquire(ctx context.Context, request *http.Reques
 	return func() {
 		once.Do(func() {
 			limiter.mu.Lock()
-			limiter.active--
+			if builtin {
+				limiter.active--
+			} else {
+				limiter.activeExternal--
+			}
 			gate.busy = false
 			if !background {
 				limiter.lastForeground = time.Now()
@@ -236,6 +288,9 @@ func (d *Downloader) doCatalogRequestWithTimeout(request *http.Request, timeout 
 func (d *Downloader) doPreparedCatalogRequest(request *http.Request, timeout time.Duration, prepare func(*http.Request)) (*http.Response, error) {
 	if background, _ := request.Context().Value(backgroundCatalogKey{}).(bool); background && (timeout <= 0 || timeout > 8*time.Second) {
 		timeout = 8 * time.Second
+	}
+	if err := checkUntrustedTarget(request); err != nil {
+		return nil, err
 	}
 	release, err := d.limiter.acquire(request.Context(), request)
 	if err != nil {

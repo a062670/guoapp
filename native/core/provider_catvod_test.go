@@ -186,7 +186,7 @@ func TestCatVodImportBrowseAndPlay(t *testing.T) {
 	engine.downloader.client.Transport = forwardToFixture(fixture)
 	spiderURL := fixture.server.URL + "/cat/demo.js"
 
-	result, err := engine.importDrpyScript(context.Background(), spiderURL)
+	result, err := engine.importDrpyScript(context.Background(), spiderURL, "")
 	if err != nil {
 		t.Fatalf("导入失败: %v", err)
 	}

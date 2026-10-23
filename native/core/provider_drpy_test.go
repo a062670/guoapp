@@ -75,7 +75,7 @@ func drpyEngine(t *testing.T) *nativeEngine {
 
 func TestDrpyImportScriptTextPersistsAndLists(t *testing.T) {
 	engine := drpyEngine(t)
-	result, err := engine.importDrpyScript(context.Background(), drpyScriptFixture)
+	result, err := engine.importDrpyScript(context.Background(), drpyScriptFixture, "")
 	if err != nil {
 		t.Fatalf("导入失败: %v", err)
 	}
@@ -118,7 +118,7 @@ func TestDrpyImportScriptTextPersistsAndLists(t *testing.T) {
 		t.Fatalf("drpySiteList 异常: %+v", list)
 	}
 	// 同 key 覆盖导入标记 added=false。
-	result, err = engine.importDrpyScript(context.Background(), drpyScriptFixture)
+	result, err = engine.importDrpyScript(context.Background(), drpyScriptFixture, "")
 	if err != nil {
 		t.Fatalf("重复导入失败: %v", err)
 	}
@@ -138,7 +138,7 @@ func TestDrpyImportScriptURL(t *testing.T) {
 	}))
 	defer server.Close()
 	engine := drpyEngine(t)
-	result, err := engine.importDrpyScript(context.Background(), server.URL+"/lib/drpy.js")
+	result, err := engine.importDrpyScript(context.Background(), server.URL+"/lib/drpy.js", "")
 	if err != nil {
 		t.Fatalf("URL 导入失败: %v", err)
 	}
@@ -162,7 +162,7 @@ func TestDrpyImportRejectsInvalidScripts(t *testing.T) {
 		{"语法错误", "var rule = { title: '坏';", "脚本语法错误"},
 	}
 	for _, item := range cases {
-		if _, err := engine.importDrpyScript(context.Background(), item.input); err == nil {
+		if _, err := engine.importDrpyScript(context.Background(), item.input, ""); err == nil {
 			t.Fatalf("%s：应当被拒绝", item.name)
 		} else if !strings.Contains(err.Error(), item.expect) {
 			t.Fatalf("%s：错误信息应为包含 %q，得到 %q", item.name, item.expect, err.Error())
@@ -170,18 +170,18 @@ func TestDrpyImportRejectsInvalidScripts(t *testing.T) {
 	}
 	// 超大脚本：入口处先按体积拒绝。
 	huge := "var rule = { title: 'x', host: 'y' };\n// " + strings.Repeat("a", drpyScriptMaxBytes)
-	if _, err := engine.importDrpyScript(context.Background(), huge); err == nil || !strings.Contains(err.Error(), "内容过大") {
+	if _, err := engine.importDrpyScript(context.Background(), huge, ""); err == nil || !strings.Contains(err.Error(), "内容过大") {
 		t.Fatalf("超大脚本应被拒绝，得到 %v", err)
 	}
 	// 空输入。
-	if _, err := engine.importDrpyScript(context.Background(), ""); err == nil {
+	if _, err := engine.importDrpyScript(context.Background(), "", ""); err == nil {
 		t.Fatal("空输入应当被拒绝")
 	}
 }
 
 func TestDrpyRemoveSiteClearsCaches(t *testing.T) {
 	engine := drpyEngine(t)
-	result, err := engine.importDrpyScript(context.Background(), drpyScriptFixture)
+	result, err := engine.importDrpyScript(context.Background(), drpyScriptFixture, "")
 	if err != nil {
 		t.Fatalf("导入失败: %v", err)
 	}

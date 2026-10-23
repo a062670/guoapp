@@ -9,6 +9,8 @@ class LibreTVSite {
     required this.api,
     this.type = 1,
     this.count = 0,
+    this.engine = '',
+    this.ruleUrl = '',
   });
 
   final String key;
@@ -23,12 +25,83 @@ class LibreTVSite {
   /// 本机已缓存的剧集数（站源管理里展示）。
   final int count;
 
+  /// 规则引擎：非空表示这是「规则型 Spider」片源（XBPQ / 海阔 / Bili）。
+  /// 这类片源的数据由本地规则解释器抓取（规则快照存在 rules/ 下），
+  /// 不需要 jar 包与 Java 运行环境；空串 = 普通 MacCMS 采集站。
+  final String engine;
+
+  /// 是否规则型 Spider 片源。
+  bool get isRule => engine.isNotEmpty;
+
+  /// 规则来源地址（远程规则才有；内联规则为空，无法跨设备重建）。
+  final String ruleUrl;
+
+  /// 规则源对应的 TVBox Spider 名（跨设备重建订阅条目时用）。
+  String get spiderApi {
+    switch (engine) {
+      case 'xbpq':
+        return 'csp_XBPQ';
+      case 'hiker':
+        return 'csp_XYQHiker';
+      case 'bili':
+        return 'csp_Bili';
+      default:
+        return '';
+    }
+  }
+
+  /// 跨设备同步用的订阅配置：用规则地址重建与原条目等价的
+  /// `{"sites":[{...,"api":"csp_XBPQ","ext":"<规则地址>"}]}`。
+  /// 内联规则（没有 ruleUrl）返回空串——别的设备无法重建，
+  /// 同步侧会跳过并提示重新导入订阅。
+  String get ruleSubscriptionJson {
+    if (!isRule || ruleUrl.isEmpty || spiderApi.isEmpty) return '';
+    return '{"sites":[{"key":"$key","name":${_jsonString(name)},"type":3,'
+        '"api":"$spiderApi","ext":${_jsonString(ruleUrl)}}]}';
+  }
+
+  /// 最小 JSON 字符串转义（名称里有引号 / 反斜杠时不破坏配置）。
+  static String _jsonString(String value) {
+    final escaped = value
+        .replaceAll(r'\', r'\\')
+        .replaceAll('"', r'\"')
+        .replaceAll('\n', r'\n');
+    return '"$escaped"';
+  }
+
   /// 完整源 ID，与 [SourceSite] 运行时注册表一致。
   String get sourceId => 'libretv:$key';
 
   bool get isXml => type == 2;
 
-  String get typeLabel => isXml ? 'XML 采集' : 'JSON 采集';
+  /// 类型标签：规则源显示引擎名（XBPQ 规则 / 海阔规则 / Bili），
+  /// 采集站沿用 JSON/XML 采集。
+  String get typeLabel {
+    switch (engine) {
+      case 'xbpq':
+        return 'XBPQ 规则';
+      case 'hiker':
+        return '海阔规则';
+      case 'bili':
+        return 'Bili';
+      default:
+        return isXml ? 'XML 采集' : 'JSON 采集';
+    }
+  }
+
+  /// 规则源的引导文案（站源管理 tooltip 用）。
+  String get engineHint {
+    switch (engine) {
+      case 'xbpq':
+        return 'XBPQ 规则源：由本地规则解释器抓取（分类/详情/搜索），无需 jar 与 Java';
+      case 'hiker':
+        return '海阔视界规则源：由本地规则解释器抓取（支持 JSON / HTML 两种截取模式）';
+      case 'bili':
+        return 'B站规则源：分类直出，搜索/详情走 B 站公开接口，播放由 WebView 嗅探';
+      default:
+        return '';
+    }
+  }
 
   SourceSite toSourceSite() =>
       SourceSite(sourceId, name, 'LibreTV $typeLabel · ${_apiHost(api)}');
@@ -39,6 +112,8 @@ class LibreTVSite {
     api: json['api'] as String? ?? '',
     type: intValue(json['type']) == 2 ? 2 : 1,
     count: intValue(json['count']),
+    engine: json['engine'] as String? ?? '',
+    ruleUrl: json['ruleUrl'] as String? ?? '',
   );
 
   static String _apiHost(String api) {
@@ -110,14 +185,27 @@ class LibreTVParseConfig {
 /// 混合订阅里发现的 drpy 脚本候选（type≥3 且 api 是 .js）。
 /// 候选不自动导入——脚本需要用户确认后才加入，这里仅携带名称与地址。
 class DrpyCandidate {
-  const DrpyCandidate({required this.name, required this.api});
+  const DrpyCandidate({
+    required this.name,
+    required this.api,
+    this.relative = false,
+  });
 
   final String name;
   final String api;
 
+  /// 脚本地址原本是相对路径（`./js/xx.js`），[api] 是按订阅地址补全出来的。
+  ///
+  /// 补全只在「订阅就是脚本所在站点」时成立。多源聚合订阅（如影视仓聚合
+  /// 518 站）把各家配置合并成一个文件却没改写相对路径，补全出来的是聚合
+  /// 文件目录下的地址，必然 404——这类站点在原版 TVBox 里同样导入不了。
+  /// 标记出来是为了在候选列表里提前提示，而不是等用户点了才报错。
+  final bool relative;
+
   factory DrpyCandidate.fromJson(Map<String, dynamic> json) => DrpyCandidate(
     name: json['name'] as String? ?? '',
     api: json['api'] as String? ?? '',
+    relative: json['relative'] as bool? ?? false,
   );
 }
 

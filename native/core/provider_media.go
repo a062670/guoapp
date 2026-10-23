@@ -19,6 +19,10 @@ type providerMedia struct {
 	CENCKey     []byte
 	Quality     int
 	Variants    []providerMedia
+	// Route 该 media 是经哪条取流线路取得的（红果为 drpys/app/web/djapi，其它源为空）。
+	// 播放层探活能发现「解析得出来、但地址播不通」，带上来源后可将这类失败
+	// 回流给线路健康度，避免下次仍优先选那条线路。
+	Route string
 }
 
 func (d *Downloader) providerBaseURL(source string) string {

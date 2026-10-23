@@ -248,3 +248,21 @@ func TestSourceBackoffUsesRelativeTimeAndRetainsTypedError(t *testing.T) {
 		t.Fatal("redaction discarded structured retry time")
 	}
 }
+
+// TestSourceStatusesReturnsAllKnownSources 批量状态必须覆盖「只有缓存、
+// 还没跑过任务」的源——否则首页会把它们的条数显示成 0。
+func TestSourceStatusesReturnsAllKnownSources(t *testing.T) {
+	engine := &nativeEngine{
+		catalogs:      map[string][]nativeDrama{sourceHongguo: {{ID: "hongguo:1", Title: "合成"}}},
+		catalogStates: map[string]nativeCatalogState{sourceHongguo: {Page: 3, HasMore: true}},
+		sourceRecords: map[string]nativeSourceRecord{},
+		sourceTasks:   map[string]*nativeSourceTask{},
+	}
+	items := engine.sourceStatuses()
+	if len(items) != 1 || items[0].Source != sourceHongguo {
+		t.Fatalf("unexpected statuses: %+v", items)
+	}
+	if items[0].Count != 1 || items[0].Page != 3 || !items[0].HasMore {
+		t.Fatalf("catalog-only source status is wrong: %+v", items[0])
+	}
+}

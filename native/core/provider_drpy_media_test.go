@@ -76,7 +76,7 @@ func drpyMediaEngine(t *testing.T, playBody string) (*nativeEngine, drpySite, Dr
 	})
 	script := strings.ReplaceAll(drpyMediaScript, "__HOST__", server.URL)
 	script = strings.ReplaceAll(script, "__PLAY_BODY__", playBody)
-	if _, err := engine.importDrpyScript(context.Background(), script); err != nil {
+	if _, err := engine.importDrpyScript(context.Background(), script, ""); err != nil {
 		t.Fatalf("导入脚本失败: %v", err)
 	}
 	list := engine.drpySiteList()

@@ -77,6 +77,11 @@ func (engine *nativeEngine) nativePreloadWarm(
 	cancel()
 	plan.PrefetchedBytes = result.Bytes
 	plan.Verified = result.OK && result.FirstByteMS > 0 && result.FirstByteMS <= nativePreloadFirstByteLimit.Milliseconds()
+	// 【回流】探活发现「解析得出来、但地址播不通」——这类失败只有播放层能观测到，
+	// 若不回流，下次解析还会优先选这条线路。归为 network（取不到首字节）。
+	if !plan.Verified && choice.route != "" {
+		hongguoRoutesHealth.noteFail(choice.route, time.Now(), hongguoFailNetwork)
+	}
 	if plan.Verified || choice.index+1 >= len(choice.media) {
 		return plan, choice
 	}

@@ -134,15 +134,29 @@ String _naturalTitle(String title) =>
     );
 
 int naturalTitleCompare(String left, String right) {
+  return compareNaturalTitleKeys(
+    naturalTitleKey(left),
+    naturalTitleKey(right),
+  );
+}
+
+/// 标题的「自然排序键」：按 数字 / 非数字 切成段。
+///
+/// 单独抽出来是为了**预计算**——自然排序的比较函数会被调用 O(n log n) 次，
+/// 每次都重新切一遍标题（还要跑正则）在千条目录上非常慢。
+/// 切割规则与 [naturalTitleCompare] 完全一致，保证排序结果不变。
+Object naturalTitleKey(String title) {
   final pattern = RegExp(r'\d+|\D+');
-  final a = pattern
-      .allMatches(_naturalTitle(left))
+  return pattern
+      .allMatches(_naturalTitle(title))
       .map((match) => match[0]!)
-      .toList();
-  final b = pattern
-      .allMatches(_naturalTitle(right))
-      .map((match) => match[0]!)
-      .toList();
+      .toList(growable: false);
+}
+
+/// 比较两个 [naturalTitleKey] 的结果。
+int compareNaturalTitleKeys(Object left, Object right) {
+  final a = left as List<String>;
+  final b = right as List<String>;
   for (var index = 0; index < a.length && index < b.length; index++) {
     final numberA = int.tryParse(a[index]);
     final numberB = int.tryParse(b[index]);
@@ -183,13 +197,33 @@ List<Drama> sortCatalog(Iterable<Drama> rows, CatalogView view) {
         _ => null,
       },
   };
+  // 排序键**预计算**。
+  //
+  // 原来把 normalizedSearchText / naturalTitleCompare 写在比较函数里：
+  // 它们是「遍历 runes + 正则替换 / 解析数字」这类重活，而比较函数会被
+  // 调用 O(n log n) 次——「全部站源」上千条目录时就是上万次字符串处理，
+  // 每帧重建都要重算一遍，表现出来就是「点一下按钮半天没反应」。
+  // 先算好放进 map，比较时只取现成的键。
+  final Map<String, String>? nameKeys = view.sort == CatalogSort.name
+      ? {
+          for (final drama in items)
+            drama.id: normalizedSearchText(drama.title),
+        }
+      : null;
+  final Map<String, Object>? naturalKeys = view.sort == CatalogSort.season
+      ? {
+          for (final drama in items)
+            drama.id: naturalTitleKey(drama.title),
+        }
+      : null;
   items.sort((a, b) {
     final comparison = switch (view.sort) {
       CatalogSort.source => 0,
-      CatalogSort.name => normalizedSearchText(
-        a.title,
-      ).compareTo(normalizedSearchText(b.title)),
-      CatalogSort.season => naturalTitleCompare(a.title, b.title),
+      CatalogSort.name => nameKeys![a.id]!.compareTo(nameKeys[b.id]!),
+      CatalogSort.season => compareNaturalTitleKeys(
+        naturalKeys![a.id]!,
+        naturalKeys[b.id]!,
+      ),
       _ => _descending(metrics[a.id], metrics[b.id]),
     };
     return comparison != 0

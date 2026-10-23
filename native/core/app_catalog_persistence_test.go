@@ -452,3 +452,50 @@ func TestNativeSourceRecordSaveFailureAndRetryDuringBackoff(t *testing.T) {
 		t.Fatal("oversized records replaced the previous saved report")
 	}
 }
+
+// TestNativeCatalogWriteCoalescing 一次「全部站源」刷新会有几十个源先后写缓存。
+// 原实现每个源都把整份 catalogs.json 重新序列化 + fsync（并持有 engine.mu），
+// 多源场景下这部分开销完全盖过网络本身。现在合并成延迟写，这里钉住三件事：
+//   - 延迟窗口内不落盘（内存里始终是最新数据）；
+//   - 多次保存只产生一次实际写盘；
+//   - flush 之后重启能读到全部数据（不丢页 / 不丢条目）。
+func TestNativeCatalogWriteCoalescing(t *testing.T) {
+	engine, err := newNativeEngine(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(engine.downloads.close)
+	// 用一个很长的延迟，确保测试期间不会由定时器触发写盘。
+	engine.catalogWriteDelay = time.Hour
+
+	path := filepath.Join(engine.directory, "catalogs.json")
+	for page := 1; page <= 3; page++ {
+		if err := engine.saveCatalogCache(nativeCatalogKey(sourceHuangguoAI, "ai-duanju"), &nativeCatalogResult{
+			Items: []nativeDrama{{ID: fmt.Sprintf("huangguoai:%d", page), Source: sourceHuangguoAI, Title: "合并写"}},
+			Page:  page, HasMore: true,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if engine.catalogWrites != 0 {
+		t.Fatalf("write happened inside the coalescing window: %d", engine.catalogWrites)
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatal("coalesced saves should not touch disk before flush")
+	}
+	// 内存读始终是最新的，不受延迟写影响。
+	if cached := engine.nativeCached(nativeCatalogKey(sourceHuangguoAI, "ai-duanju")); len(cached.Items) != 3 || cached.Page != 3 {
+		t.Fatalf("memory catalog fell behind: %+v", cached)
+	}
+
+	if err := engine.flushCatalogDiskNow(); err != nil {
+		t.Fatal(err)
+	}
+	if engine.catalogWrites != 1 {
+		t.Fatalf("expected exactly one physical write, got %d", engine.catalogWrites)
+	}
+	restarted := reopenCatalogEngine(t, engine.directory, nil)
+	if cached := restarted.nativeCached(nativeCatalogKey(sourceHuangguoAI, "ai-duanju")); len(cached.Items) != 3 || cached.Page != 3 {
+		t.Fatalf("flush lost catalog data: %+v", cached)
+	}
+}

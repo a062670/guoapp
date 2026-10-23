@@ -192,6 +192,69 @@ class _WebDavSyncScreenState extends State<WebDavSyncScreen> {
     }
   }
 
+  /// 清理云端站源：确认后把云端片源订阅清单整体替换为本机清单。
+  ///
+  /// 同步是取并集，对端设备导入过的失效站源会被反复带回来；这个操作让
+  /// 云端清单回到「本机现在有什么」，各设备下次同步即对齐。
+  /// 只影响片源订阅，追剧记录与收藏/隐藏状态不动。
+  Future<void> _purgeSubs() async {
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('清理云端站源'),
+        content: const Text(
+          '会把云端保存的片源订阅清单整体替换为「本机当前的站源」，\n\n'
+          '· 其他设备此前同步上去的失效站源将被清掉\n'
+          '· 之后各设备同步到的都是本机这一份\n'
+          '· 追剧记录、收藏/隐藏状态不受影响\n\n'
+          '确定继续吗？',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context, false),
+            child: const Text('取消'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(context, true),
+            child: const Text('清理'),
+          ),
+        ],
+      ),
+    );
+    if (confirmed != true) return;
+    if (_dirty) await _save();
+    if (!mounted) return;
+    setState(() {
+      _busy = true;
+      _message = '';
+      _outcome = null;
+      _warnings = const [];
+    });
+    final settings = widget.store.webDavSettings;
+    final transport = HttpWebDavTransport(
+      username: settings.username,
+      password: settings.password,
+    );
+    try {
+      final result = await WebDavSynchronizer(
+        store: widget.store,
+        transport: transport,
+        repository: widget.repository,
+      ).purgeRemoteSourceSubs();
+      if (!mounted) return;
+      setState(() {
+        _message =
+            '已清理云端站源：改写 ${result.files} 个同步文件，'
+            '清掉 ${result.cleared} 条云端条目，云端清单已替换为本机 ${result.local} 个站源';
+      });
+    } catch (failure) {
+      if (mounted) setState(() => _message = failure.toString());
+    } finally {
+      transport.close();
+      if (mounted) setState(() => _busy = false);
+    }
+  }
+
   @override
   Widget build(BuildContext context) => AnimatedBuilder(
     animation: widget.store,
@@ -330,6 +393,12 @@ class _WebDavSyncScreenState extends State<WebDavSyncScreen> {
                       onPressed: _busy || !_form.configured ? null : _sync,
                       icon: const Icon(Icons.cloud_sync_outlined),
                       label: const Text('立即同步'),
+                    ),
+                    OutlinedButton.icon(
+                      key: const ValueKey('webdav-purge-subs'),
+                      onPressed: _busy || !_form.configured ? null : _purgeSubs,
+                      icon: const Icon(Icons.cleaning_services_outlined),
+                      label: const Text('清理云端站源'),
                     ),
                   ],
                 ),

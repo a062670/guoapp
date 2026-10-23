@@ -1,0 +1,7 @@
+//数据接口
+{"sites":[
+// 下面是采集站
+{"key":"m1","name":"采集站一","type":1,"api":"https://api.example.com/provide/vod/"},
+/* 块注释 */
+{"key":"m2","name":"采集站二","type":1,"api":"https://api2.example.com/api.php/provide/vod/"}
+]}

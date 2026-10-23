@@ -293,6 +293,135 @@ void main() {
     expect(b.isFavorite(dramaA.id), isTrue);
     expect(b.isFavorite(foreign.id), isFalse);
   });
+
+  test('purge remote source subs replaces cloud list with local', () async {
+    final store = await createStore();
+    await configure(store);
+    final self = store.lanDocument.replica;
+    // 云端两台设备的文件：本机 + 另一台（带着已失效的旧站源）。
+    final files = <String, String>{
+      '$self.json': jsonEncode({
+        'schema': WebDavSynchronizer.schema,
+        'document': {
+          'replica': self,
+          'counter': 1,
+          'records': {},
+          'sourceSubs': {
+            'libretv:old': {
+              'name': '本机旧源',
+              'api': 'https://old.example.com',
+              'at': 0,
+            },
+          },
+        },
+      }),
+      'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.json': jsonEncode({
+        'schema': WebDavSynchronizer.schema,
+        'document': {
+          'replica': 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',
+          'counter': 1,
+          'records': {},
+          'sourceSubs': {
+            'libretv:dead1': {
+              'name': '失效源一',
+              'api': 'https://d1.example.com',
+              'at': 5,
+            },
+            'libretv:dead2': {
+              'name': '失效源二',
+              'api': 'https://d2.example.com',
+              'at': 6,
+            },
+          },
+        },
+      }),
+    };
+    final transport = FakeWebDavTransport(files: files);
+    final result = await WebDavSynchronizer(
+      store: store,
+      transport: transport,
+    ).purgeRemoteSourceSubs();
+
+    // 本机没配片源仓库 → 本机清单为空，两处云端清单都被清空。
+    expect(result.files, 2);
+    expect(result.cleared, 2);
+    expect(result.local, 0);
+
+    final other = jsonDecode(files['bbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.json']!) as Map;
+    final otherDoc = other['document'] as Map;
+    expect((otherDoc['sourceSubs'] as Map).isEmpty, isTrue);
+    // 追剧记录不能被牵连。
+    expect(otherDoc.containsKey('records'), isTrue);
+  });
+
+  test('purge remote source subs overwrites own replica too', () async {
+    final store = await createStore();
+    await configure(store);
+    final self = store.lanDocument.replica;
+    final files = <String, String>{
+      '$self.json': jsonEncode({
+        'schema': WebDavSynchronizer.schema,
+        'document': {
+          'replica': self,
+          'counter': 1,
+          'sourceSubs': {
+            'libretv:gone': {
+              'name': '已删除源',
+              'api': 'https://gone.example.com',
+              'at': 0,
+            },
+          },
+        },
+      }),
+      'cccccccccccccccccccccccccccccccc.json': jsonEncode({
+        'schema': WebDavSynchronizer.schema,
+        'document': {
+          'replica': 'cccccccccccccccccccccccccccccccc',
+          'sourceSubs': {
+            'libretv:dead': {
+              'name': '失效源',
+              'api': 'https://d.example.com',
+              'at': 1,
+            },
+          },
+        },
+      }),
+    };
+    final transport = FakeWebDavTransport(files: files);
+    final result = await WebDavSynchronizer(
+      store: store,
+      transport: transport,
+    ).purgeRemoteSourceSubs();
+
+    expect(result.files, 2);
+    expect(result.cleared, 1, reason: '只统计其他设备被清掉的条目');
+    expect(result.local, 0);
+
+    // 本机文件同样被「本机当前清单」覆盖：本机没有站源时旧条目必须清掉。
+    final mine = jsonDecode(files['$self.json']!) as Map;
+    final subs = (mine['document'] as Map)['sourceSubs'] as Map;
+    expect(subs.containsKey('libretv:gone'), isFalse);
+    expect(subs.isEmpty, isTrue);
+  });
+
+  test('purge remote source subs skips non-sync files', () async {
+    final store = await createStore();
+    await configure(store);
+    // 目录里只有非同步文件：不能被改写，且要给出明确提示。
+    final files = <String, String>{
+      'readme.txt': 'not a sync file',
+      'broken.json': 'not json at all',
+    };
+    final transport = FakeWebDavTransport(files: files);
+    expect(
+      () => WebDavSynchronizer(
+        store: store,
+        transport: transport,
+      ).purgeRemoteSourceSubs(),
+      throwsA(isA<StateError>()),
+    );
+    expect(transport.writes, isEmpty, reason: '非同步文件不应被改写');
+  });
 }
 
 class _FailingTransport implements WebDavTransport {

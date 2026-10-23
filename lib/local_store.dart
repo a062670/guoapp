@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 import 'dart:math';
 
@@ -11,6 +12,7 @@ import 'playback_preferences.dart';
 import 'download_preferences.dart';
 import 'catalog_sort.dart';
 import 'follow_state.dart';
+import 'source_health.dart';
 import 'hongguo_series.dart';
 import 'lan_sync_models.dart';
 
@@ -53,6 +55,14 @@ class LocalStore extends ChangeNotifier {
   final Map<String, Drama> _favorites = {};
   final Map<String, FollowState> _followStates = {};
   final Map<String, Drama> _seriesCandidates = {};
+
+  /// 源级健康度账本（连续失败 / 平均耗时）。
+  ///
+  /// **设备本地数据**：只反映这台机器到各站点的网络状况，不参与 WebDAV /
+  /// 局域网同步（另一个设备可能完全通畅）。因此用不带 profile 前缀的键，
+  /// 也不在 `_commit` 里打同步标记。
+  SourceHealthBook _sourceHealth = SourceHealthBook();
+  DateTime _sourceHealthSavedAt = DateTime.fromMillisecondsSinceEpoch(0);
 
   /// 收藏的运行时片源 ID（`libretv:` / `drpy:`）→ 收藏状态时间戳。
   /// 收藏后首页不再并入 LibreTV / drpy 大组，与红果等同级独占一组。
@@ -101,6 +111,7 @@ class LocalStore extends ChangeNotifier {
       _locked = forceLogin && profile.protected;
       _loadSourceGate();
       _loadLibrary();
+      _loadSourceHealth();
     } catch (_) {
       _block('本地用户配置损坏，已锁定访问。原始记录已保留，请重新读取或从备份恢复。');
     }
@@ -493,6 +504,43 @@ class LocalStore extends ChangeNotifier {
       } catch (_) {}
     }
   }
+
+  /// 源级健康度账本（只读视图，供目录浏览 / 站源更新排序使用）。
+  SourceHealthBook get sourceHealth => _sourceHealth;
+
+  void _loadSourceHealth() {
+    _sourceHealth = SourceHealthBook.fromJson(_string('sourceHealth'));
+    _sourceHealthSavedAt = DateTime.fromMillisecondsSinceEpoch(0);
+  }
+
+  /// 记录一次站源请求结果。
+  ///
+  /// 落盘做了 3 秒节流（**不是**定时器）：一次刷新几十个源，逐条写盘等于把
+  /// 刚省下来的时间又花回磁盘上。健康度只是加速用的旁路数据，最多丢最后
+  /// 几秒的记录，不影响任何功能。刻意不用 Timer，避免在 widget 测试里留下
+  /// 悬挂计时器。
+  void noteSourceHealth(
+    String source, {
+    required bool ok,
+    required int elapsedMs,
+  }) {
+    if (_configurationError != null || source.isEmpty) return;
+    if (!_sourceHealth.record(source, ok: ok, elapsedMs: elapsedMs)) return;
+    final now = DateTime.now();
+    if (now.difference(_sourceHealthSavedAt) < const Duration(seconds: 3)) {
+      return;
+    }
+    _sourceHealthSavedAt = now;
+    final raw = _sourceHealth.toJson();
+    unawaited(
+      _queue(
+        () => _commit({'sourceHealth': raw}, trackSync: false),
+      ),
+    );
+  }
+
+  /// 用户在站源管理里手动重试时清掉记录，避免「刚修好还被跳过」。
+  void forgetSourceHealth(String source) => _sourceHealth.reset(source);
 
   List<WatchEntry> get history =>
       _history.values
@@ -1003,16 +1051,26 @@ class LocalStore extends ChangeNotifier {
       final history = Map.of(_history);
       final states = Map.of(_followStates);
       final seriesCandidates = Map.of(_seriesCandidates);
+      // 变更标记：以前这里靠「重新 jsonEncode 一遍旧数据再比字符串」判断要不要
+      // 写，一次刷新几千条剧时等于把收藏 / 追剧状态全量序列化两遍（实测百毫秒
+      // 级）。现在在合并循环里顺手记下有没有命中，只有真的变了才编码。
+      var favoritesChanged = false;
+      var historyChanged = false;
+      var statesChanged = false;
+      var seriesChanged = false;
       for (final drama in updates) {
         if (!allowsSource(drama.source)) continue;
         if (cacheSeriesCandidates && drama.source == SourceSite.hongguo.id) {
           seriesCandidates[drama.id] = (seriesCandidates[drama.id] ?? drama)
               .merge(drama);
+          seriesChanged = true;
         }
         final favorite = favorites[drama.id];
         if (favorite != null) {
           favorites[drama.id] = favorite.merge(drama);
           states[drama.id] = states[drama.id]!.observe(favorites[drama.id]!);
+          favoritesChanged = true;
+          statesChanged = true;
         }
         final watched = history[drama.id];
         if (watched != null) {
@@ -1023,48 +1081,60 @@ class LocalStore extends ChangeNotifier {
             duration: watched.duration,
             updatedAt: watched.updatedAt,
           );
+          historyChanged = true;
         }
       }
-      final candidates = <String, Drama>{
-        for (final entry in history.values) entry.drama.id: entry.drama,
-        ...favorites,
-        for (final drama in updates)
-          if (allowsSource(drama.source)) drama.id: drama,
-      };
-      for (final state in states.values) {
-        for (final notice in state.seriesSeasons.values) {
-          candidates.putIfAbsent(
-            notice.id,
-            () => Drama(
-              id: notice.id,
-              source: SourceSite.hongguo.id,
-              sourceId: notice.id.substring(SourceSite.hongguo.id.length + 1),
-              title: notice.title,
-            ),
+      // 只有存在「红果收藏」时才需要把全量剧集做成候选表来推断季/集关系。
+      // 「全部站源」刷新时收藏里通常没有红果条目，这一整张几千条的 map
+      // 没有消费者，直接跳过。
+      final hongguoFavorites = [
+        for (final favorite in favorites.values)
+          if (favorite.source == SourceSite.hongguo.id &&
+              states[favorite.id] != null)
+            favorite,
+      ];
+      if (hongguoFavorites.isNotEmpty) {
+        final candidates = <String, Drama>{
+          for (final entry in history.values) entry.drama.id: entry.drama,
+          ...favorites,
+          for (final drama in updates)
+            if (allowsSource(drama.source)) drama.id: drama,
+        };
+        for (final state in states.values) {
+          for (final notice in state.seriesSeasons.values) {
+            candidates.putIfAbsent(
+              notice.id,
+              () => Drama(
+                id: notice.id,
+                source: SourceSite.hongguo.id,
+                sourceId: notice.id.substring(SourceSite.hongguo.id.length + 1),
+                title: notice.title,
+              ),
+            );
+          }
+        }
+        final favoriteIds = favorites.keys.toSet();
+        for (final favorite in hongguoFavorites) {
+          states[favorite.id] = observeHongguoSeriesSeasons(
+            anchor: favorite,
+            state: states[favorite.id]!,
+            candidates: candidates.values,
+            favoriteIds: favoriteIds,
           );
         }
+        statesChanged = true;
       }
-      final favoriteIds = favorites.keys.toSet();
-      for (final favorite in favorites.values) {
-        if (favorite.source != SourceSite.hongguo.id ||
-            states[favorite.id] == null) {
-          continue;
-        }
-        states[favorite.id] = observeHongguoSeriesSeasons(
-          anchor: favorite,
-          state: states[favorite.id]!,
-          candidates: candidates.values,
-          favoriteIds: favoriteIds,
-        );
-      }
-      final favoriteJson = jsonEncode(
-        favorites.values.map((entry) => entry.toJson()).toList(),
-      );
-      final historyJson = jsonEncode(
-        history.values.map((entry) => entry.toJson()).toList(),
-      );
-      final statesJson = _encodeFollowStates(states);
-      final seriesCandidateJson = cacheSeriesCandidates
+      final favoriteJson = favoritesChanged
+          ? jsonEncode(favorites.values.map((entry) => entry.toJson()).toList())
+          : '';
+      final historyJson = historyChanged
+          ? jsonEncode(history.values.map((entry) => entry.toJson()).toList())
+          : '';
+      final statesJson = statesChanged
+          ? _encodeFollowStates(states)
+          : '';
+      final seriesCandidateJson =
+          cacheSeriesCandidates && seriesChanged
           ? jsonEncode(
               (seriesCandidates.values.toList()
                     ..sort((a, b) => a.id.compareTo(b.id)))
@@ -1073,28 +1143,10 @@ class LocalStore extends ChangeNotifier {
                   .toList(),
             )
           : null;
-      if (favoriteJson !=
-          jsonEncode(
-            _favorites.values.map((entry) => entry.toJson()).toList(),
-          )) {
-        changes[_key('favorites')] = favoriteJson;
-      }
-      if (historyJson !=
-          jsonEncode(_history.values.map((entry) => entry.toJson()).toList())) {
-        changes[_key('history')] = historyJson;
-      }
-      if (statesJson != _encodeFollowStates(_followStates)) {
-        changes[_key('followStates')] = statesJson;
-      }
-      if (seriesCandidateJson != null &&
-          seriesCandidateJson !=
-              jsonEncode(
-                (_seriesCandidates.values.toList()
-                      ..sort((a, b) => a.id.compareTo(b.id)))
-                    .take(2000)
-                    .map((entry) => entry.toJson())
-                    .toList(),
-              )) {
+      if (favoriteJson.isNotEmpty) changes[_key('favorites')] = favoriteJson;
+      if (historyJson.isNotEmpty) changes[_key('history')] = historyJson;
+      if (statesJson.isNotEmpty) changes[_key('followStates')] = statesJson;
+      if (seriesCandidateJson != null) {
         changes[_key('seriesCandidates')] = seriesCandidateJson;
       }
       if (changes.isEmpty) return;
@@ -1408,6 +1460,7 @@ class LocalStore extends ChangeNotifier {
     _locked = forceLogin && profile.protected;
     _loadSourceGate();
     _loadLibrary();
+    _loadSourceHealth();
     _epoch++;
     _notify();
   }

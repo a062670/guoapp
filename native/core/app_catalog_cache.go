@@ -238,7 +238,7 @@ func (engine *nativeEngine) saveCatalogCache(source string, result *nativeCatalo
 	if base, _, categorized := strings.Cut(source, "|"); categorized {
 		engine.catalogs[base] = mergeNativeCatalog(engine.catalogs[base], items)
 	}
-	err := engine.writeCatalogDiskLocked()
+	err := engine.commitCatalogDiskLocked()
 	result.saveError = err
 	if err != nil {
 		result.Warning = joinNativeWarnings(result.Warning, err.Error())
@@ -248,6 +248,7 @@ func (engine *nativeEngine) saveCatalogCache(source string, result *nativeCatalo
 }
 
 func (engine *nativeEngine) writeCatalogDiskLocked() error {
+	engine.catalogWrites++
 	body, err := json.Marshal(nativeCatalogDisk{Version: 3, Catalogs: engine.catalogs, States: engine.catalogStates, Categories: engine.categoryOptions, HongguoApp: engine.hongguoCatalog, Recommendations: engine.recommendations})
 	if err == nil && len(body) > nativeCatalogMaxBytes {
 		err = errNativeCatalogLimit
@@ -262,6 +263,49 @@ func (engine *nativeEngine) writeCatalogDiskLocked() error {
 		engine.markCatalogSavePendingLocked()
 	}
 	return engine.catalogSaveError
+}
+
+// commitCatalogDiskLocked 落盘入口（调用方必须持有 engine.mu）。
+//
+// catalogWriteDelay 为 0 时退化成同步写：直接序列化 + fsync + rename。
+// 大于 0 时只置脏标记、安排一次延迟写。一次「全部站源」刷新里几十个源
+// 会连续调用它，合并后实际写盘次数从「每源一次」降到「每 1.5 秒一次」。
+//
+// 为什么可以延迟：engine.catalogs 才是读取源（nativeCached 只读内存），
+// 磁盘文件只用于下次启动。延迟窗口内进程被杀最多丢这一批**缓存**，
+// 不会丢收藏 / 历史（那些走另一条持久化链路）。
+func (engine *nativeEngine) commitCatalogDiskLocked() error {
+	if engine.catalogWriteDelay <= 0 {
+		return engine.writeCatalogDiskLocked()
+	}
+	engine.catalogDirty = true
+	if engine.catalogFlush == nil {
+		engine.catalogFlush = time.AfterFunc(engine.catalogWriteDelay, engine.flushCatalogDisk)
+	}
+	return nil
+}
+
+func (engine *nativeEngine) flushCatalogDisk() {
+	engine.mu.Lock()
+	defer engine.mu.Unlock()
+	engine.catalogFlush = nil
+	if !engine.catalogDirty {
+		return
+	}
+	engine.catalogDirty = false
+	_ = engine.writeCatalogDiskLocked()
+}
+
+// flushCatalogDiskNow 立即把待写数据落盘（测试 / 需要确定性的场合）。
+func (engine *nativeEngine) flushCatalogDiskNow() error {
+	engine.mu.Lock()
+	defer engine.mu.Unlock()
+	if engine.catalogFlush != nil {
+		engine.catalogFlush.Stop()
+		engine.catalogFlush = nil
+	}
+	engine.catalogDirty = false
+	return engine.writeCatalogDiskLocked()
 }
 
 func writeNativeCacheFile(path string, data []byte) error {
@@ -300,7 +344,7 @@ func (engine *nativeEngine) saveDetailMetadata(drama nativeDrama) error {
 		}
 	}
 	if changed {
-		return engine.writeCatalogDiskLocked()
+		return engine.commitCatalogDiskLocked()
 	}
 	return nil
 }

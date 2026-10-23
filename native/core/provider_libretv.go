@@ -33,6 +33,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -47,6 +48,12 @@ const (
 	libretvProbeBudget = 15 * time.Second
 	// libretvProbePerSite 单个站点探测超时上限。
 	libretvProbePerSite = 5 * time.Second
+	// libretvProbeWorkers 导入时并发探测的协程数。
+	//
+	// 一次订阅可能带几十个站点（上限 50），串行逐个探测会把 15 秒预算
+	// 全部用满，表现出来就是「点导入后卡住」。并发 6 个后通常几秒内完成。
+	// 不再往上加：片源站点多为小站，并发过高容易被风控。
+	libretvProbeWorkers = 6
 	// libretvSubscriptionMaxBytes 订阅内容大小上限（512KB）。
 	libretvSubscriptionMaxBytes = 512 << 10
 )
@@ -60,6 +67,11 @@ type libretvSite struct {
 	// 2 = MacCMS XML 采集接口（at/xml）。旧版 libretv.json 没有该字段，
 	// 反序列化为 0，按 JSON 处理，向后兼容。
 	Type int `json:"type,omitempty"`
+	// Engine 规则引擎（xbpq / hiker / bili）：非空表示该站点是规则型
+	// Spider 源，数据抓取由 rules store 里的规则快照驱动，不走 MacCMS。
+	// 空串 = 普通采集站（含旧版 libretv.json 的历史站点，天然兼容）。
+	// 规则正文不在这里——见 provider_rules_store.go 的 ruleStore。
+	Engine string `json:"engine,omitempty"`
 }
 
 // libretvNormalizeSiteType 归一化站点类型：只区分「XML(2)」与「JSON(其余)」。
@@ -77,12 +89,44 @@ func libretvNormalizeSiteType(siteType int) int {
 // 本项目扩展：Type == 2 且 URL 以 .js 结尾 = 本地脚本解析，
 // 由 goja 执行脚本里的 parse(url)，**不是 TVBox 标准语义**，
 // 标准配置里的 type=2 聚合解析不会被当成脚本。
+// libretvParse 解析方式（订阅的 parses 段）。
+//
+// 字段类型刻意做成「宽松」：真实订阅里 type 有写成字符串的情况
+// （影视仓聚合订阅就有 `"type": "1"`），用 int 会让**整份订阅**解析失败——
+// 518 个站点因为一条解析规则报废。这里统一按 libretvFlexibleInt 取值。
 type libretvParse struct {
-	Name string `json:"name"`
-	Type int    `json:"type"`
-	URL  string `json:"url"`
+	Name string         `json:"name"`
+	Type libretvFlexInt `json:"type"`
+	URL  string         `json:"url"`
 	// Ext 原样保留订阅里的 ext（对象/数组），仅存档展示，不参与执行。
 	Ext json.RawMessage `json:"ext,omitempty"`
+}
+
+// libretvFlexInt 容忍「数字或数字字符串」的整数字段。
+// TVBox 订阅由人工维护，同一字段在不同仓里可能是 1 也可能是 "1"。
+type libretvFlexInt int
+
+func (v *libretvFlexInt) UnmarshalJSON(data []byte) error {
+	text := strings.TrimSpace(string(data))
+	if text == "" || text == "null" {
+		*v = 0
+		return nil
+	}
+	// 去掉字符串引号后按整数解析；解析不了就当 0，不阻断整份订阅。
+	if strings.HasPrefix(text, `"`) {
+		if unquoted, err := strconv.Unquote(text); err == nil {
+			text = unquoted
+		} else {
+			text = strings.Trim(text, `"`)
+		}
+	}
+	value, err := strconv.Atoi(strings.TrimSpace(text))
+	if err != nil {
+		*v = 0
+		return nil
+	}
+	*v = libretvFlexInt(value)
+	return nil
 }
 
 // libretvParseKind 返回解析方式的中文类型名（UI 展示用）。
@@ -184,8 +228,34 @@ func loadLibreTVStore(directory string) *libretvStore {
 		return store
 	}
 	for _, site := range payload.Sites {
+		// 规则源的 API 只是「站点地址 / 展示用」，可能是裸域名（XBPQ 的主页url
+		// 常是 https://host:端口），不能走采集站的「必须带路径」校验，
+		// 否则重启后整条规则源会被静默丢弃。
+		if engine := normalizeRuleEngine(site.Engine); engine != "" {
+			key := strings.TrimSpace(site.Key)
+			if !libretvKeyPattern.MatchString(key) {
+				continue
+			}
+			name := strings.TrimSpace(site.Name)
+			if name == "" {
+				name = "规则片源"
+			}
+			store.sites[key] = libretvSite{
+				Key:    key,
+				Name:   name,
+				API:    strings.TrimSpace(site.API),
+				Type:   1,
+				Engine: engine,
+			}
+			continue
+		}
 		if key, name, api, ok := normalizeLibreTVSite(site.Key, site.Name, site.API, site.Type); ok {
-			store.sites[key] = libretvSite{Key: key, Name: name, API: api, Type: libretvNormalizeSiteType(site.Type)}
+			store.sites[key] = libretvSite{
+				Key:  key,
+				Name: name,
+				API:  api,
+				Type: libretvNormalizeSiteType(site.Type),
+			}
 		}
 	}
 	for _, parse := range payload.Parses {
@@ -435,7 +505,8 @@ type libretvConfigSite struct {
 	Key  string `json:"key"`
 	Name string `json:"name"`
 	API  string `json:"api"`
-	Type int    `json:"type"`
+	// Type 同样是宽松整数：社区订阅里 type 有写成 "3" 的。
+	Type libretvFlexInt `json:"type"`
 	// Ext TVBox type≥3 的扩展字段：drpy 站点里 api 是运行时库
 	// （drpy2.min.js），ext 才是真正的站点脚本地址。也可能是对象或
 	// JSON 规则文件（csp_ 规则），此时不参与脚本候选。
@@ -460,10 +531,40 @@ func libretvConfigExtText(raw json.RawMessage) string {
 // 的 .js」才算脚本。
 func libretvConfigExtScriptURL(raw json.RawMessage) string {
 	text := libretvConfigExtText(raw)
-	if !looksLikeDrpyScriptURL(text) {
+	if text == "" {
 		return ""
 	}
-	return text
+	if looksLikeDrpyScriptURL(text) {
+		return text
+	}
+	// 相对脚本路径（`./js/xxx.js`、`../lib/xxx.js`）：高天流云等大仓普遍
+	// 这么写（api 是运行时库，ext 才是站点脚本）。这里原样返回，由调用方
+	// 按订阅地址补全——修这个之前，298 站的大仓只能识别出 6 个运行时库。
+	if libretvLooksLikeScriptPath(text) {
+		return text
+	}
+	return ""
+}
+
+// libretvLooksLikeScriptPath 判断是否是相对脚本路径（待补全）。
+// 形态：`./js/xx.js`、`../lib/xx.js`、`js/xx.js`、`/lib/xx.js`。
+// 排除 csp_ / http(s) 等明显不是路径的写法。
+func libretvLooksLikeScriptPath(raw string) bool {
+	text := strings.TrimSpace(raw)
+	if text == "" || strings.ContainsAny(text, " \t\n\r") {
+		return false
+	}
+	if strings.HasPrefix(text, "csp_") || strings.HasPrefix(text, "py_") {
+		return false
+	}
+	if strings.HasPrefix(text, "http://") || strings.HasPrefix(text, "https://") {
+		return false
+	}
+	path := text
+	if cut := strings.IndexAny(path, "?#;"); cut >= 0 {
+		path = path[:cut]
+	}
+	return strings.HasSuffix(strings.ToLower(path), ".js")
 }
 
 // libretvConfigScriptCandidate 决定 type≥3 条目的脚本候选地址。
@@ -573,6 +674,11 @@ func libretvDisplayName(entry libretvConfigSite) string {
 
 // libretvExtractJSONObject 从订阅内容里截取 JSON 对象：
 // 兼容纯 JSON、var config = {...}; 之类的 JS 包裹、以及带前后缀杂文本的情况。
+// libretvExtractJSONObject 从任意文本里抠出 JSON 对象（订阅正文可能带
+// 前后包裹文本或 HTML）。
+//
+// 注意：这里**不做**注释剥离，保持「原始切片」语义——调用方可自行决定。
+// 订阅配置的注释剥离统一走 libretvCleanConfigText。
 func libretvExtractJSONObject(body string) string {
 	trimmed := strings.TrimSpace(body)
 	start := strings.Index(trimmed, "{")
@@ -583,11 +689,77 @@ func libretvExtractJSONObject(body string) string {
 	return trimmed[start : end+1]
 }
 
+// libretvCleanConfigText 清洗订阅/配置文本，让「人工维护的不严格 JSON」
+// 也能解析。做三件事：
+//
+//  1. 去 BOM；
+//  2. 去 // 与 /* */ 注释——真实订阅普遍带注释（maoystv 的 001.json
+//     第 2 行就是 `//数据接口`），不处理会整份解析失败；
+//  3. 转义字符串字面量里的裸换行 / 制表符——真实订阅里作者手滑断行很常见
+//     （小盒子 4K 的 `"优\n酷"` 中间就是真换行），标准 JSON 不允许，
+//     Go 的 encoding/json 会直接报错。
+//
+// 不做的事：不去尾随逗号、不修中文引号——那些属于「文件损坏」，宁可报错
+// 让用户换源，也不要猜出一份可能张冠李戴的配置。
+func libretvCleanConfigText(body string) string {
+	return escapeRawJSONControlChars(ruleStripJSONComments(strings.TrimPrefix(body, "\ufeff")))
+}
+
+// escapeRawJSONControlChars 把 JSON 字符串字面量内部的裸控制字符转义。
+// 扫描时区分「字符串内 / 字符串外」，只在字符串内替换，避免影响结构空白。
+func escapeRawJSONControlChars(body string) string {
+	if !strings.ContainsAny(body, "\n\r\t") {
+		return body
+	}
+	var builder strings.Builder
+	builder.Grow(len(body))
+	inString := false
+	escaped := false
+	for i := 0; i < len(body); i++ {
+		c := body[i]
+		if inString {
+			switch {
+			case escaped:
+				builder.WriteByte(c)
+				escaped = false
+			case c == '\\':
+				builder.WriteByte(c)
+				escaped = true
+			case c == '"':
+				builder.WriteByte(c)
+				inString = false
+			case c == '\n':
+				builder.WriteString(`\n`)
+			case c == '\r':
+				builder.WriteString(`\r`)
+			case c == '\t':
+				builder.WriteString(`\t`)
+			default:
+				builder.WriteByte(c)
+			}
+			continue
+		}
+		if c == '"' {
+			inString = true
+		}
+		builder.WriteByte(c)
+	}
+	return builder.String()
+}
+
 // drpyCandidate 混合订阅里发现的 drpy 脚本候选：type≥3 且 api 是 .js
 // 脚本地址。不自动导入（脚本需要单独校验），由用户在站源管理一键导入。
 type drpyCandidate struct {
 	Name string
 	API  string
+	// Relative 脚本地址原本是相对路径（`./js/xx.js`），上面的 API 是按
+	// 订阅地址补全出来的。
+	//
+	// 补全只在「订阅就是脚本所在站点」时成立；多源聚合订阅（如影视仓
+	// 聚合 518 站）把各家的配置合并成一个文件却**没改写相对路径**，补全
+	// 出来的是聚合文件所在目录下的地址，必然 404。标记出来是为了在候选
+	// 列表里提示，避免用户一个个点了才发现全失败。
+	Relative bool
 }
 
 // looksLikeDrpyScriptURL 判断订阅里的 api 是否像 drpy 脚本地址
@@ -600,29 +772,63 @@ func looksLikeDrpyScriptURL(raw string) bool {
 	return strings.HasSuffix(strings.ToLower(parsed.Path), ".js")
 }
 
-// parseLibreTVSubscription 解析 LibreTV 订阅配置，返回可导入站点、drpy
-// 脚本候选、解析规则（parses）与被跳过原因。type≥3 且 api 是 .js 脚本
-// 地址的收成 drpy 候选（用户在站源管理一键导入）；type≥3 的非脚本地址
-// （csp_ 规则等）与历史行为一致带原因跳过；type=0/1/缺省按 JSON 采集接口
-// 导入，type=2 按 XML 采集接口导入（TVBox 的苹果CMS XML 版本）。
-// baseURL 为订阅自身的地址，用于把 CatVod 蜘蛛常见的相对写法
+// libretvParseResult 订阅解析结果。
+//
+// 规则型 Spider（XBPQ / 海阔 / Bili）加入后返回值由五元组收拢成结构体：
+// 后续再加引擎字段时不必再动所有调用方（测试里有 8 处解构调用）。
+type libretvParseResult struct {
+	// Sites 可直接入库的采集站（MacCMS JSON/XML 与 csp_AppYsV2）。
+	Sites []libretvSite
+	// DrpyCandidates type≥3 且 api 是 .js 的脚本候选（用户确认后导入）。
+	DrpyCandidates []drpyCandidate
+	// RuleCandidates 规则型 Spider 候选（导入期下载 / 校验 / 入库）。
+	RuleCandidates []ruleCandidate
+	// Parses 订阅里的解析规则。
+	Parses []libretvParse
+	// ParseBroken parses 段解析失败（字段类型不合规等）：站点仍可导入，
+	// 只是没有解析方式，导入结果里会提示。
+	ParseBroken bool
+	// Skipped 被跳过的条目与原因。
+	Skipped []string
+}
+
+// parseLibreTVSubscription 解析 LibreTV 订阅配置。
+//
+// type≥3 的判定顺序：drpy 脚本候选 → 规则型 Spider（XBPQ / 海阔 /
+// Bili，纯数据规则）→ csp_AppYsV2 采集接口 → 带原因跳过；type=0/1/缺省
+// 按 JSON 采集接口导入，type=2 按 XML 采集接口导入（TVBox 的苹果CMS XML
+// 版本）。baseURL 为订阅自身地址，用于把 CatVod 蜘蛛常见的相对写法
 // （./cat/xxx_open.js）补全成完整地址后再判定候选。
-func parseLibreTVSubscription(body, baseURL string) (sites []libretvSite, drpyCandidates []drpyCandidate, parses []libretvParse, skipped []string, err error) {
-	document := libretvExtractJSONObject(body)
+func parseLibreTVSubscription(body, baseURL string) (libretvParseResult, error) {
+	// 先清洗（去 BOM / // 注释），再抠 JSON 对象：真实订阅普遍带注释，
+	// 不清洗会整份解析失败。
+	cleaned := libretvCleanConfigText(body)
+	document := libretvExtractJSONObject(cleaned)
 	if document == "" {
-		return nil, nil, nil, nil, errors.New("未找到有效的 LibreTV 配置（需要包含 sites 的 JSON）")
+		return libretvParseResult{}, errors.New("未找到有效的 LibreTV 配置（需要包含 sites 的 JSON）")
 	}
-	var config struct {
-		Sites  []libretvConfigSite `json:"sites"`
-		Parses []libretvParse      `json:"parses"`
+	// sites 与 parses **分开解析**：两者在订阅里是并列字段，其中一段写坏
+	// 不该拖垮另一段。真实订阅「影视仓聚合」的 parses 里有一条
+	// `"type": "1"`（字符串），合在一起解析会让 518 个站点全部报废。
+	var siteDoc struct {
+		Sites []libretvConfigSite `json:"sites"`
 	}
-	if json.Unmarshal([]byte(document), &config) != nil {
-		return nil, nil, nil, nil, errors.New("配置解析失败，请确认是 LibreTV/TVBox 格式的 JSON")
+	if json.Unmarshal([]byte(document), &siteDoc) != nil {
+		return libretvParseResult{}, errors.New("配置解析失败，请确认是 LibreTV/TVBox 格式的 JSON")
 	}
+	var parseDoc struct {
+		Parses []libretvParse `json:"parses"`
+	}
+	// parses 解析失败只记跳过原因——解析方式缺失不阻断片源导入。
+	if json.Unmarshal([]byte(document), &parseDoc) != nil {
+		parseDoc.Parses = nil
+	}
+	var result libretvParseResult
+	result.ParseBroken = json.Unmarshal([]byte(document), &parseDoc) != nil
 	// parses 与 sites 相互独立：只带解析规则的订阅也可以导入（解析方式本身
 	// 对已导入的站点同样生效）。
 	seenParse := map[string]bool{}
-	for _, raw := range config.Parses {
+	for _, raw := range parseDoc.Parses {
 		parse, ok := normalizeLibreTVParse(raw)
 		if !ok {
 			// TVBox 内置 WebView 嗅探（url 是 "Web" 之类的标记）在纯 Go 端
@@ -633,36 +839,53 @@ func parseLibreTVSubscription(body, baseURL string) (sites []libretvSite, drpyCa
 			continue
 		}
 		seenParse[parse.URL] = true
-		parses = append(parses, parse)
+		result.Parses = append(result.Parses, parse)
 	}
-	if len(config.Sites) == 0 && len(parses) == 0 {
-		return nil, nil, nil, nil, errors.New("配置里没有 sites 条目")
+	if len(siteDoc.Sites) == 0 && len(result.Parses) == 0 {
+		return libretvParseResult{}, errors.New("配置里没有 sites 条目")
 	}
 	seenAPI := map[string]bool{}
 	usedKey := map[string]bool{}
-	for _, entry := range config.Sites {
+	for _, entry := range siteDoc.Sites {
 		api := strings.TrimSpace(entry.API)
 		if api == "" {
-			skipped = append(skipped, fmt.Sprintf("%s：缺少 api 地址", libretvDisplayName(entry)))
+			result.Skipped = append(result.Skipped, fmt.Sprintf("%s：缺少 api 地址", libretvDisplayName(entry)))
 			continue
 		}
 		if entry.Type >= 3 {
 			// drpy/spider 脚本：优先取 ext（TVBox 约定 ext 是站点脚本，
-			// api 是 drpy 运行时库）；其余（csp_ 规则等）不支持。
+			// api 是 drpy 运行时库）；不是脚本的条目继续往下判规则源。
 			candidate := libretvConfigScriptCandidate(entry)
 			// 相对路径（CatVod 蜘蛛的 ./cat/xxx.js）：按订阅地址补全。
-			if !isProviderHTTPMediaURL(candidate) {
+			relative := !isProviderHTTPMediaURL(candidate)
+			if relative {
 				if resolved := catVodResolveURL(baseURL, candidate); resolved != "" {
 					candidate = resolved
 				}
 			}
 			if looksLikeDrpyScriptURL(candidate) && !seenAPI[candidate] {
-				drpyCandidates = append(drpyCandidates, drpyCandidate{Name: libretvDisplayName(entry), API: candidate})
+				result.DrpyCandidates = append(result.DrpyCandidates, drpyCandidate{
+					Name:     libretvDisplayName(entry),
+					API:      candidate,
+					Relative: relative,
+				})
 				seenAPI[candidate] = true
 				continue
 			}
 			// 同一脚本地址重复出现：静默去重，不刷跳过原因。
 			if looksLikeDrpyScriptURL(candidate) {
+				continue
+			}
+			// 规则型 Spider（csp_XBPQ / csp_XYQHiker / csp_Bili）：
+			// 纯数据规则，Go 重写解释器，不依赖 JVM / jar 包。
+			// 识别阶段只判形状（ext 形态 + 必需字段），远程规则的下载
+			// 与字段校验在导入期完成（importLibreTVRuleCandidates）。
+			if rule, reason := ruleCandidateFromEntry(baseURL, entry); rule.Engine != "" || reason != "" {
+				if reason != "" {
+					result.Skipped = append(result.Skipped, reason)
+					continue
+				}
+				result.RuleCandidates = append(result.RuleCandidates, rule)
 				continue
 			}
 			// type=4 服务器 / csp_AppYsV2：接口地址可直接按 MacCMS 采集站导入。
@@ -674,23 +897,23 @@ func parseLibreTVSubscription(body, baseURL string) (sites []libretvSite, drpyCa
 					}
 					seenAPI[normalized] = true
 					usedKey[key] = true
-					sites = append(sites, libretvSite{Key: key, Name: name, API: normalized, Type: 1})
-					if len(sites) >= libretvImportMaxSites {
-						skipped = append(skipped, fmt.Sprintf("站点数量超过 %d 个，仅导入前 %d 个", libretvImportMaxSites, libretvImportMaxSites))
+					result.Sites = append(result.Sites, libretvSite{Key: key, Name: name, API: normalized, Type: 1})
+					if len(result.Sites) >= libretvImportMaxSites {
+						result.Skipped = append(result.Skipped, fmt.Sprintf("站点数量超过 %d 个，仅导入前 %d 个", libretvImportMaxSites, libretvImportMaxSites))
 						break
 					}
 					continue
 				}
 			}
-			skipped = append(
-				skipped,
+			result.Skipped = append(
+				result.Skipped,
 				fmt.Sprintf("%s：%s", libretvDisplayName(entry), libretvUnsupportedReason(entry)),
 			)
 			continue
 		}
-		key, name, normalized, ok := normalizeLibreTVSite(entry.Key, entry.Name, api, entry.Type)
+		key, name, normalized, ok := normalizeLibreTVSite(entry.Key, entry.Name, api, int(entry.Type))
 		if !ok {
-			skipped = append(skipped, fmt.Sprintf("%s：接口地址无效", libretvDisplayName(entry)))
+			result.Skipped = append(result.Skipped, fmt.Sprintf("%s：接口地址无效", libretvDisplayName(entry)))
 			continue
 		}
 		if seenAPI[normalized] {
@@ -701,17 +924,18 @@ func parseLibreTVSubscription(body, baseURL string) (sites []libretvSite, drpyCa
 		}
 		seenAPI[normalized] = true
 		usedKey[key] = true
-		sites = append(sites, libretvSite{Key: key, Name: name, API: normalized, Type: libretvNormalizeSiteType(entry.Type)})
-		if len(sites) >= libretvImportMaxSites {
-			skipped = append(skipped, fmt.Sprintf("站点数量超过 %d 个，仅导入前 %d 个", libretvImportMaxSites, libretvImportMaxSites))
+		result.Sites = append(result.Sites, libretvSite{Key: key, Name: name, API: normalized, Type: libretvNormalizeSiteType(int(entry.Type))})
+		if len(result.Sites) >= libretvImportMaxSites {
+			result.Skipped = append(result.Skipped, fmt.Sprintf("站点数量超过 %d 个，仅导入前 %d 个", libretvImportMaxSites, libretvImportMaxSites))
 			break
 		}
 	}
-	// 只有 drpy 候选 / 解析规则时不算失败：用户可一键导入脚本源或直接用解析。
-	if len(sites) == 0 && len(drpyCandidates) == 0 && len(parses) == 0 {
-		return nil, nil, nil, skipped, errors.New("配置里没有可导入的采集接口站点")
+	// 只有 drpy / 规则候选 / 解析规则时不算失败：用户可一键导入脚本源
+	// 或直接用解析。
+	if len(result.Sites) == 0 && len(result.DrpyCandidates) == 0 && len(result.RuleCandidates) == 0 && len(result.Parses) == 0 {
+		return libretvParseResult{Skipped: result.Skipped}, errors.New("配置里没有可导入的采集接口站点")
 	}
-	return sites, drpyCandidates, parses, skipped, nil
+	return result, nil
 }
 
 // looksLikeMacCMSAPI 判断裸地址是否像 MacCMS 采集接口（用于配置解析失败的兜底）。
@@ -748,18 +972,23 @@ func (engine *nativeEngine) importLibreTVSubscription(ctx context.Context, raw s
 	if isProviderHTTPMediaURL(text) && !strings.ContainsAny(text, "\n\r") {
 		configURL = text
 	}
-	sites, drpyCandidates, parses, skipped, err := parseLibreTVSubscription(body, configURL)
+	parsed, err := parseLibreTVSubscription(body, configURL)
 	if err != nil && looksLikeLibreTVBase58(body) {
 		// 社区配置工具（LunaTV-config 等）的 Base58 订阅：format=2 是原始 JSON、
 		// format=3 是带代理前缀的 JSON，解码后复用同一套解析，客户端不需要
 		// 实时解析 type≥3 脚本，也不需要自建后端。
 		if decoded, decodeErr := libretvBase58Decode(body); decodeErr == nil {
-			decodedSites, decodedDrpy, decodedParses, decodedSkipped, decodedErr := parseLibreTVSubscription(string(decoded), configURL)
-			// 部分站点不可用时也保留跳过原因（例如配置里混了 drpy 源）。
-			if decodedErr == nil || len(decodedSkipped) > 0 {
-				sites, drpyCandidates, parses, skipped, err = decodedSites, decodedDrpy, decodedParses, decodedSkipped, decodedErr
+			if decodedResult, decodedErr := parseLibreTVSubscription(string(decoded), configURL); decodedErr == nil || len(decodedResult.Skipped) > 0 {
+				// 部分站点不可用时也保留跳过原因（例如配置里混了 drpy 源）。
+				parsed, err = decodedResult, decodedErr
 			}
 		}
+	}
+	sites, drpyCandidates, ruleCandidates, parses, skipped := parsed.Sites, parsed.DrpyCandidates, parsed.RuleCandidates, parsed.Parses, parsed.Skipped
+	// 解析段写坏（字段类型不合规等）：站点已照常导入，但要让用户知道
+	// 「解析方式没进来」——否则会出现「片源在但点开播不了」的困惑。
+	if parsed.ParseBroken {
+		skipped = append(skipped, "订阅的解析规则（parses）格式不合规已跳过，片源照常导入；部分需要解析的片源可能无法播放")
 	}
 	if err != nil {
 		// 兜底：输入本身就是裸采集接口地址时，按单站点导入。
@@ -782,39 +1011,86 @@ func (engine *nativeEngine) importLibreTVSubscription(ctx context.Context, raw s
 	if err := store.putParses(parses); err != nil {
 		skipped = append(skipped, fmt.Sprintf("解析规则保存失败（%s）", publicError(err)))
 	}
-	added := make([]map[string]any, 0, len(sites))
-	verified := 0
-	budget := libretvProbeBudget
+	// 规则型 Spider：远程规则下载 + 形状校验 + 快照入库，成功者并入
+	// 本次待入库站点（随下面的统一探测一起验证）。规则是纯数据，
+	// 不做用户二次确认（与需要执行代码的 drpy 脚本不同）。
+	if len(ruleCandidates) > 0 {
+		ruleSites, ruleSkipped := engine.importLibreTVRuleCandidates(ctx, ruleCandidates, libretvImportMaxSites-len(sites))
+		sites = append(sites, ruleSites...)
+		skipped = append(skipped, ruleSkipped...)
+	}
+	// 先串行入库（保证 key 冲突处理与顺序稳定），再并发探测。
+	pending := sites[:0:0]
 	for _, site := range sites {
 		if _, err := store.put(site); err != nil {
 			skipped = append(skipped, fmt.Sprintf("%s：保存失败（%s）", site.Name, publicError(err)))
 			continue
 		}
-		ok := false
-		if budget > 0 {
-			per := libretvProbePerSite
-			if per > budget {
-				per = budget
-			}
-			started := time.Now()
-			probeCtx, cancel := context.WithTimeout(ctx, per)
-			// 直接走目录链路：既验证接口，又把首页写进缓存，
-			// 导入完成后站源管理里立刻能看到剧集数。
-			page, probeErr := engine.nativeCatalog(probeCtx, nativeInput{Source: libretvSourceID(site.Key), Page: 1, Force: true})
-			cancel()
-			budget -= time.Since(started)
-			ok = probeErr == nil && len(page.Items) > 0 && page.Warning == ""
-			if ok {
-				verified++
-			}
-		}
-		added = append(added, map[string]any{"key": site.Key, "name": site.Name, "api": site.API, "type": site.Type, "verified": ok})
+		pending = append(pending, site)
 	}
+	added := make([]map[string]any, len(pending))
+	verified := 0
+	// 并发探测：一次订阅几十个站点时串行会把总预算跑满，表现为导入卡住。
+	// budget 是所有协程共享的剩余预算，取用与扣减都在锁内。
+	var probeMu sync.Mutex
+	budget := libretvProbeBudget
+	var probeGroup sync.WaitGroup
+	semaphore := make(chan struct{}, libretvProbeWorkers)
+	for index, site := range pending {
+		probeGroup.Add(1)
+		semaphore <- struct{}{}
+		go func(index int, site libretvSite) {
+			defer probeGroup.Done()
+			defer func() { <-semaphore }()
+			ok := false
+			probeMu.Lock()
+			remaining := budget
+			probeMu.Unlock()
+			if remaining > 0 && ctx.Err() == nil {
+				per := libretvProbePerSite
+				if per > remaining {
+					per = remaining
+				}
+				started := time.Now()
+				probeCtx, cancel := context.WithTimeout(ctx, per)
+				// 直接走目录链路：既验证接口，又把首页写进缓存，
+				// 导入完成后站源管理里立刻能看到剧集数。
+				page, probeErr := engine.nativeCatalog(probeCtx, nativeInput{Source: libretvSourceID(site.Key), Page: 1, Force: true})
+				cancel()
+				elapsed := time.Since(started)
+				ok = probeErr == nil && len(page.Items) > 0 && page.Warning == ""
+				probeMu.Lock()
+				budget -= elapsed
+				if ok {
+					verified++
+				}
+				probeMu.Unlock()
+			}
+			probeMu.Lock()
+			added[index] = map[string]any{
+				"key":      site.Key,
+				"name":     site.Name,
+				"api":      site.API,
+				"type":     site.Type,
+				"engine":   site.Engine,
+				"verified": ok,
+			}
+			probeMu.Unlock()
+		}(index, site)
+	}
+	probeGroup.Wait()
 	// 订阅变更后 Dart 侧会重新拉取列表，无需额外广播。
 	// drpy 候选不自动导入（脚本需要用户确认后才加入），仅透传给 Dart 侧展示。
 	drpy := make([]map[string]any, 0, len(drpyCandidates))
 	for _, candidate := range drpyCandidates {
-		drpy = append(drpy, map[string]any{"name": candidate.Name, "api": candidate.API})
+		// relative 标记脚本地址原本是相对路径（按订阅地址补全而来）。
+		// 多源聚合订阅往往没改写相对路径，补全出来必然 404——标出来让
+		// UI 提前提示，别让用户一个个点了才发现全失败。
+		drpy = append(drpy, map[string]any{
+			"name":     candidate.Name,
+			"api":      candidate.API,
+			"relative": candidate.Relative,
+		})
 	}
 	// 解析规则已入库；这里同样回传一份，导入结果对话框可直接展示。
 	importedParses := make([]map[string]any, 0, len(parses))
@@ -834,6 +1110,104 @@ func (engine *nativeEngine) importLibreTVSubscription(ctx context.Context, raw s
 		"drpy":     drpy,
 		"parses":   importedParses,
 	}, nil
+}
+
+// importLibreTVRuleCandidates 规则候选落地：远程规则下载 → 形状校验 →
+// 规则快照入库 → 返回可入库的站点。
+//
+// 与 drpy 候选的差异：规则是纯数据（不执行代码），不需要用户二次确认，
+// 导入订阅时直接落地；失败仅跳过该源并给出具体原因，不影响其余源。
+// 下载共享预算（ruleDownloadBudget），防止几十个规则源拖垮一次导入。
+//
+// remaining 为本次导入还能新增的站点数（与采集站共享
+// libretvImportMaxSites 上限）。
+func (engine *nativeEngine) importLibreTVRuleCandidates(ctx context.Context, candidates []ruleCandidate, remaining int) ([]libretvSite, []string) {
+	d := engine.downloader
+	rules := d.rulesStore()
+	sites := make([]libretvSite, 0, len(candidates))
+	var skipped []string
+	seen := map[string]bool{}
+	usedKey := map[string]bool{}
+	budget := ruleDownloadBudget
+	for _, candidate := range candidates {
+		if len(sites) >= remaining {
+			skipped = append(skipped, fmt.Sprintf("站点数量超过 %d 个，仅导入前 %d 个", libretvImportMaxSites, libretvImportMaxSites))
+			break
+		}
+		// 同一订阅里重复出现的规则（同地址 / 同站内联规则）静默去重。
+		if identity := candidate.identity(); identity != "" {
+			if seen[identity] {
+				continue
+			}
+			seen[identity] = true
+		}
+		rule := candidate.Rule
+		if rule == nil {
+			if budget <= 0 {
+				skipped = append(skipped, fmt.Sprintf("%s：规则下载超出本次导入预算，请重新导入或稍后再试", candidate.Name))
+				continue
+			}
+			per := ruleDownloadPerSite
+			if per > budget {
+				per = budget
+			}
+			ruleCtx, cancel := context.WithTimeout(ctx, per)
+			fetched, err := d.fetchRuleDocument(ruleCtx, candidate.RuleURL)
+			cancel()
+			budget -= per
+			if err != nil {
+				skipped = append(skipped, fmt.Sprintf("%s：规则下载失败（%s）", candidate.Name, publicError(err)))
+				continue
+			}
+			rule = fetched
+		}
+		if reason := validateRuleDocument(candidate.Engine, rule); reason != "" {
+			skipped = append(skipped, fmt.Sprintf("%s：%s", candidate.Name, reason))
+			continue
+		}
+		siteAPI := ruleSiteAPI(candidate.Engine, rule, candidate.RuleURL)
+		// normalizeLibreTVSite 要求 api 带路径：XBPQ 的「主页url」常是
+		// 裸域名（https://host:5200），补一个 "/" 让它通过校验
+		// （入库时末尾斜杠会被去掉）。
+		if parsed, err := url.Parse(siteAPI); err == nil && parsed.Scheme != "" && parsed.Path == "" {
+			siteAPI += "/"
+		}
+		// key 优先级：订阅里合法的 key（用户可识别、跨导入稳定）>
+		// 规则地址派生（同一规则重复导入稳定）> 站点地址派生（内联规则）。
+		rawKey := strings.TrimSpace(candidate.Key)
+		if !libretvKeyPattern.MatchString(rawKey) {
+			rawKey = ""
+			if candidate.RuleURL != "" {
+				rawKey = libretvKeyFromAPI(candidate.RuleURL)
+			}
+		}
+		key, name, api, ok := normalizeLibreTVSite(rawKey, candidate.Name, siteAPI, 1)
+		if !ok {
+			skipped = append(skipped, fmt.Sprintf("%s：站点地址无效", candidate.Name))
+			continue
+		}
+		for usedKey[key] { // key 冲突时退化：优先用规则地址区分
+			seed := api
+			if candidate.RuleURL != "" {
+				seed = candidate.RuleURL
+			}
+			key = libretvKeyFromAPI(seed + "/" + strconv.Itoa(len(usedKey)))
+		}
+		usedKey[key] = true
+		entry := ruleEntry{
+			Key:       key,
+			Engine:    candidate.Engine,
+			File:      ruleBodyFile(key),
+			SourceURL: candidate.RuleURL,
+			UpdatedAt: time.Now().Format(time.RFC3339),
+		}
+		if err := rules.put(entry, rule); err != nil {
+			skipped = append(skipped, fmt.Sprintf("%s：规则保存失败（%s）", candidate.Name, publicError(err)))
+			continue
+		}
+		sites = append(sites, libretvSite{Key: key, Name: name, API: api, Type: 1, Engine: candidate.Engine})
+	}
+	return sites, skipped
 }
 
 // removeLibreTVSite 删除已导入站点，并清掉它的目录缓存与任务记录。
@@ -873,6 +1247,10 @@ func (engine *nativeEngine) removeLibreTVSite(key string) error {
 	if err := store.remove(key); err != nil {
 		return err
 	}
+	// 规则源连带删除规则快照（普通采集站没有对应条目，remove 为空操作）。
+	if err := engine.downloader.rulesStore().remove(key); err != nil {
+		return err
+	}
 	engine.saveSourceRecordsFile()
 	if saveErr != nil {
 		return saveErr
@@ -903,13 +1281,22 @@ func (engine *nativeEngine) libretvSiteList() []map[string]any {
 	engine.mu.Unlock()
 	out := make([]map[string]any, 0)
 	for _, site := range store.list() {
-		out = append(out, map[string]any{
-			"key":   site.Key,
-			"name":  site.Name,
-			"api":   site.API,
-			"type":  site.Type,
-			"count": counts[site.Key],
-		})
+		item := map[string]any{
+			"key":    site.Key,
+			"name":   site.Name,
+			"api":    site.API,
+			"type":   site.Type,
+			"engine": site.Engine,
+			"count":  counts[site.Key],
+		}
+		// 规则源带上规则来源地址：跨设备同步时凭它重建规则（重新下载）。
+		// 内联规则的来源地址为空，无法在别的设备重建，同步侧会跳过并提示。
+		if site.Engine != "" {
+			if entry, ok := engine.downloader.rulesStore().get(site.Key); ok && entry.SourceURL != "" {
+				item["ruleUrl"] = entry.SourceURL
+			}
+		}
+		out = append(out, item)
 	}
 	return out
 }
@@ -1228,7 +1615,23 @@ func libretvHTMLText(raw string) string {
 
 // fetchLibreTVCatalogPage 拉取一页列表/搜索结果。
 // category 为 MacCMS type_id（数字），query 非空时走 wd 搜索。
+// 规则型 Spider（XBPQ / 海阔 / Bili）在函数入口分派到各自引擎，
+// app_runtime.go 的四处调用点保持零改动。
 func (d *Downloader) fetchLibreTVCatalogPage(ctx context.Context, site libretvSite, page int, category, query string) ([]Drama, bool, error) {
+	if entry, err := d.libretvRuleEntry(site); err != nil {
+		return nil, false, err
+	} else if entry != nil {
+		switch entry.Engine {
+		case ruleEngineXBPQ:
+			return d.fetchXBPQCatalogPage(ctx, site, *entry, page, category, query)
+		case ruleEngineHiker:
+			return d.fetchHikerCatalogPage(ctx, site, *entry, page, category, query)
+		case ruleEngineBili:
+			return d.fetchBiliCatalogPage(ctx, site, *entry, page, category, query)
+		default:
+			return nil, false, errors.New("该站源的规则引擎暂不支持，请重新导入订阅")
+		}
+	}
 	if site.Type == 2 {
 		return d.fetchLibreTVCatalogPageXML(ctx, site, page, category, query)
 	}
@@ -1277,6 +1680,20 @@ func (d *Downloader) fetchLibreTVCatalogPage(ctx context.Context, site libretvSi
 
 // fetchLibreTVCategories 拉取分类（ac=list → class 列表）；站点不支持时只有「全部」。
 func (d *Downloader) fetchLibreTVCategories(ctx context.Context, site libretvSite) ([]nativeCategory, error) {
+	if entry, err := d.libretvRuleEntry(site); err != nil {
+		return nil, err
+	} else if entry != nil {
+		switch entry.Engine {
+		case ruleEngineXBPQ:
+			return d.fetchXBPQCategories(site, *entry)
+		case ruleEngineHiker:
+			return d.fetchHikerCategories(site, *entry)
+		case ruleEngineBili:
+			return d.fetchBiliCategories(site, *entry)
+		default:
+			return nil, errors.New("该站源的规则引擎暂不支持，请重新导入订阅")
+		}
+	}
 	if site.Type == 2 {
 		return d.fetchLibreTVCategoriesXML(ctx, site)
 	}
@@ -1307,6 +1724,20 @@ func (d *Downloader) fetchLibreTVDetail(ctx context.Context, site libretvSite, v
 	vodID = strings.TrimSpace(vodID)
 	if vodID == "" {
 		return Drama{}, nil, errors.New("片源 ID 无效")
+	}
+	if entry, err := d.libretvRuleEntry(site); err != nil {
+		return Drama{}, nil, err
+	} else if entry != nil {
+		switch entry.Engine {
+		case ruleEngineXBPQ:
+			return d.fetchXBPQDetail(ctx, site, *entry, vodID)
+		case ruleEngineHiker:
+			return d.fetchHikerDetail(ctx, site, *entry, vodID)
+		case ruleEngineBili:
+			return d.fetchBiliDetail(ctx, site, *entry, vodID)
+		default:
+			return Drama{}, nil, errors.New("该站源的规则引擎暂不支持，请重新导入订阅")
+		}
 	}
 	if site.Type == 2 {
 		return d.fetchLibreTVDetailXML(ctx, site, vodID)

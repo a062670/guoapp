@@ -74,6 +74,19 @@ func drpyCheckTarget(ctx context.Context, target *url.URL) error {
 	return nil
 }
 
+type untrustedTargetKey struct{}
+
+func withUntrustedTargets(ctx context.Context) context.Context {
+	return context.WithValue(ctx, untrustedTargetKey{}, true)
+}
+
+func checkUntrustedTarget(request *http.Request) error {
+	if untrusted, _ := request.Context().Value(untrustedTargetKey{}).(bool); !untrusted {
+		return nil
+	}
+	return drpyCheckTarget(request.Context(), request.URL)
+}
+
 func drpyGuardedClient(ctx context.Context, client *http.Client) *http.Client {
 	scoped := *client
 	previous := client.CheckRedirect

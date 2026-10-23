@@ -23,6 +23,8 @@ import 'player_screen.dart';
 import 'video_enhancement_assets.dart';
 import 'webdav_sync.dart';
 import 'diary_service.dart';
+import 'drpy.dart';
+import 'libretv.dart';
 
 Future<void> main(List<String> arguments) async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -115,21 +117,25 @@ class _AppBootstrapState extends State<AppBootstrap>
   /// 拉取已导入的 LibreTV 片源与 drpy 脚本源并注册为运行时站源。
   /// 失败（旧版核心不支持等）时静默跳过，不影响内置站源。
   Future<void> _syncRuntimeSources() async {
-    try {
-      final sites = await repository.libretvSites();
-      SourceSite.setRuntimeSources([
-        for (final site in sites)
-          if (site.key.isNotEmpty) site.toSourceSite(),
-      ]);
-    } catch (_) {}
-    try {
-      final scripts = await repository.drpySites();
-      SourceSite.setRuntimeSources([
-        ...SourceSite.runtimeValues,
-        for (final script in scripts)
-          if (script.key.isNotEmpty) script.toSourceSite(),
-      ]);
-    } catch (_) {}
+    // 两个注册表互不依赖，并行拉取：原来串行等两次 FFI，启动首屏要多花
+    // 一个来回（长列表时是肉眼可见的延迟）。
+    final sitesRequest = repository.libretvSites().catchError(
+      (Object _) => const <LibreTVSite>[],
+    );
+    final scriptsRequest = repository.drpySites().catchError(
+      (Object _) => const <DrpySite>[],
+    );
+    final sites = await sitesRequest;
+    SourceSite.setRuntimeSources([
+      for (final site in sites)
+        if (site.key.isNotEmpty) site.toSourceSite(),
+    ]);
+    final scripts = await scriptsRequest;
+    SourceSite.setRuntimeSources([
+      ...SourceSite.runtimeValues,
+      for (final script in scripts)
+        if (script.key.isNotEmpty) script.toSourceSite(),
+    ]);
   }
 
   Future<void> _initialize() async {

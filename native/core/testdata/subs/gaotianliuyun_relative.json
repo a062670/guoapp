@@ -1,0 +1,30 @@
+{
+ "sites": [
+  {
+   "key": "drpy_js_douban",
+   "name": "搜索 | 豆瓣[js]",
+   "type": 3,
+   "api": "./lib/drpy2.min.js",
+   "ext": "./js/drpy.js"
+  },
+  {
+   "key": "drpy_js_cilixiong",
+   "name": "搜索 | 磁力熊[js]",
+   "type": 3,
+   "api": "./lib/drpy2.min.js",
+   "ext": "./js/cilixiong.js"
+  },
+  {
+   "key": "lf_js_search",
+   "name": "搜索 | 路飞[js]",
+   "type": 3,
+   "api": "./lib/lf_search3_min.js"
+  },
+  {
+   "key": "douban_csp",
+   "name": "豆瓣",
+   "type": 3,
+   "api": "csp_Douban"
+  }
+ ]
+}

@@ -404,7 +404,13 @@ func validateDrpyScript(script string) error {
 
 // importDrpyScript 导入 drpy 脚本源：输入可以是 JS 文本（粘贴）或脚本 URL
 // （http/https 的 .js 地址，拉取后同一套校验）。已存在的同 key 源被覆盖。
-func (engine *nativeEngine) importDrpyScript(ctx context.Context, raw string) (any, error) {
+// importDrpyScript 导入 drpy 脚本源。
+//
+// sourceURL 是「粘贴脚本文本」时的来源链接（可选）：脚本正文本身没有
+// 地址，不记来源的话 WebDAV 同步无法在对端重建该源（只能跳过）。
+// 记下后，同步侧按该地址重新拉取脚本——源站脚本更新也能一并带到对端。
+// 直接粘贴地址导入时忽略该参数（以地址为准）。
+func (engine *nativeEngine) importDrpyScript(ctx context.Context, raw, sourceURL string) (any, error) {
 	text := strings.TrimSpace(raw)
 	if text == "" {
 		return nil, errors.New("请输入 drpy 脚本内容或脚本地址")
@@ -420,6 +426,12 @@ func (engine *nativeEngine) importDrpyScript(ctx context.Context, raw string) (a
 			return nil, fmt.Errorf("脚本获取失败：%w", publicError(err))
 		}
 		script, scriptURL = fetched, text
+	} else if trimmed := strings.TrimSpace(sourceURL); trimmed != "" {
+		// 粘贴文本 + 来源链接：地址只作记录（不覆盖用户粘贴的正文）。
+		if !isProviderHTTPMediaURL(trimmed) {
+			return nil, errors.New("来源链接无效，请填写 http(s) 地址或不填")
+		}
+		scriptURL = trimmed
 	}
 	// CatVod 蜘蛛（__jsEvalReturn + import './lib/cat.js'）走另一套处理：
 	// 需要先剥离 import、下载并转换 lib/cat.js，再按普通脚本保存。
@@ -451,13 +463,14 @@ func (engine *nativeEngine) importDrpyScript(ctx context.Context, raw string) (a
 	}
 	engine.downloader.drpy.invalidateProgram(key)
 	return map[string]any{
-		"key":   site.Key,
-		"name":  site.Name,
-		"title": site.Title,
-		"host":  site.Host,
-		"file":  site.File,
-		"added": added,
-		"total": 1,
+		"key":       site.Key,
+		"name":      site.Name,
+		"title":     site.Title,
+		"host":      site.Host,
+		"file":      site.File,
+		"scriptUrl": site.ScriptURL,
+		"added":     added,
+		"total":     1,
 	}, nil
 }
 

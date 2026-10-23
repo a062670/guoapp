@@ -75,11 +75,13 @@ class SourceSite {
     for (final site in sites) {
       if (site.isRuntime) _runtimeSources[site.id] = site;
     }
+    _invalidateSourceCaches();
   }
 
   /// 注销一个运行时站源（删除 LibreTV 片源用）。
   static void unregisterRuntime(String id) {
     _runtimeSources.remove(id.trim());
+    _invalidateSourceCaches();
   }
 
   /// 当前已注册的运行时站源列表（按 ID 排序，输出稳定）。
@@ -93,11 +95,26 @@ class SourceSite {
     ...(allSourcesEnabled ? knownValues : [hongguo]),
     ...runtimeValues,
   ];
-  static bool isAvailable(String id) => values.any((site) => site.id == id);
+  /// 站源 ID 集合缓存。
+  ///
+  /// `isAvailable` / `isPrimary` 会被 `allowsSource` **逐条**调用：首页
+  /// 「全部站源」一次刷新上千条，每条都重建一遍 `values`（含运行时源排序）
+  /// 再线性查找，等于每帧做几千次「建列表 + 排序」——这是加载期间卡顿的
+  /// 一个真实来源。注册表只在导入 / 删除运行时源时变化，用版本缓存掉。
+  static Set<String>? _availableCache;
+  static Set<String>? _primaryCache;
+
+  static void _invalidateSourceCaches() {
+    _availableCache = null;
+    _primaryCache = null;
+  }
+
+  static bool isAvailable(String id) =>
+      (_availableCache ??= {for (final site in values) site.id}).contains(id);
   static bool isKnown(String id) =>
       allValues.any((site) => site.id == id) || _runtimeSources.containsKey(id);
   static bool isPrimary(String id) =>
-      primaryValues.any((site) => site.id == id);
+      (_primaryCache ??= {for (final site in primaryValues) site.id}).contains(id);
   static bool isRestricted(String id) =>
       restrictedValues.any((site) => site.id == id);
 

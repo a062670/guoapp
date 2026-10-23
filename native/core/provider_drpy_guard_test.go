@@ -3,6 +3,7 @@ package core
 import (
 	"context"
 	"errors"
+	"net/http"
 	"net/url"
 	"os"
 	"testing"
@@ -47,5 +48,22 @@ func TestDrpyCheckTargetRejectsLocalAddresses(t *testing.T) {
 		if err := drpyCheckTarget(context.Background(), target); err != nil {
 			t.Errorf("%s: expected public address to pass, got %v", raw, err)
 		}
+	}
+}
+
+func TestCheckUntrustedTargetOnlyGuardsMarkedRequests(t *testing.T) {
+	drpyAllowPrivateTargets = false
+	defer func() { drpyAllowPrivateTargets = true }()
+	trusted, _ := http.NewRequestWithContext(context.Background(), http.MethodGet, "http://192.168.1.1/", nil)
+	if err := checkUntrustedTarget(trusted); err != nil {
+		t.Fatalf("built-in source request must not be guarded: %v", err)
+	}
+	marked, _ := http.NewRequestWithContext(withUntrustedTargets(context.Background()), http.MethodGet, "http://192.168.1.1/", nil)
+	if err := checkUntrustedTarget(marked); !errors.Is(err, errDrpyPrivateTarget) {
+		t.Fatalf("rule request to a private address must be rejected, got %v", err)
+	}
+	public, _ := http.NewRequestWithContext(withUntrustedTargets(context.Background()), http.MethodGet, "http://1.1.1.1/", nil)
+	if err := checkUntrustedTarget(public); err != nil {
+		t.Fatalf("rule request to a public address must pass: %v", err)
 	}
 }

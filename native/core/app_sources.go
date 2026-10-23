@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 )
@@ -120,6 +121,40 @@ func (engine *nativeEngine) saveSourceRecordsLocked() error {
 	}
 	engine.sourceSaveError = nativeSaveError("站源任务记录", err)
 	return engine.sourceSaveError
+}
+
+// sourceStatuses 一次返回所有站源的状态。
+//
+// 首页的 LibraryUpdater 每 10 秒轮询一遍（有任务时 2 秒），原来按源逐个
+// 发 RPC：几十个源就是几十次 FFI + isolate 启动，启动首屏和轮询时都在
+// 白白烧主线程。合并成一次调用后只剩一份 JSON。
+func (engine *nativeEngine) sourceStatuses() []nativeSourceStatus {
+	engine.mu.Lock()
+	seen := map[string]bool{}
+	for source := range engine.sourceRecords {
+		seen[canonicalProviderSource(source)] = true
+	}
+	for key := range engine.catalogs {
+		base, _, _ := strings.Cut(key, "|")
+		seen[canonicalProviderSource(base)] = true
+	}
+	for key := range engine.catalogStates {
+		base, _, _ := strings.Cut(key, "|")
+		seen[canonicalProviderSource(base)] = true
+	}
+	sources := make([]string, 0, len(seen))
+	for source := range seen {
+		if nativeSourceAvailable(source) {
+			sources = append(sources, source)
+		}
+	}
+	engine.mu.Unlock()
+	sort.Strings(sources)
+	items := make([]nativeSourceStatus, 0, len(sources))
+	for _, source := range sources {
+		items = append(items, engine.sourceStatus(source))
+	}
+	return items
 }
 
 func (engine *nativeEngine) sourceStatus(source string) nativeSourceStatus {

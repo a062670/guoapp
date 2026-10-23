@@ -1,0 +1,33 @@
+{
+ "sites": [
+  {
+   "key": "s1",
+   "name": "采集站一",
+   "type": 1,
+   "api": "https://api.example.com/provide/vod/"
+  },
+  {
+   "key": "s2",
+   "name": "采集站二",
+   "type": "1",
+   "api": "https://api2.example.com/api.php/provide/vod/"
+  }
+ ],
+ "parses": [
+  {
+   "name": "解析一",
+   "type": 1,
+   "url": "https://jx.example.com/?url="
+  },
+  {
+   "name": "解析二",
+   "type": "1",
+   "url": "https://jx2.example.com/?url="
+  },
+  {
+   "name": "解析三",
+   "type": "0",
+   "url": "https://jx3.example.com/?url="
+  }
+ ]
+}

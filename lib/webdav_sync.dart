@@ -360,6 +360,80 @@ class WebDavSynchronizer {
     );
   }
 
+  /// 清理云端站源订阅：用本机当前站源清单**整体覆盖**云端。
+  ///
+  /// 使用场景：换过一批片源、或某台设备导了一堆已经失效的站源后，云端
+  /// 清单会越并越大（同步是取并集），对端每次同步都会把旧站源带回来。
+  /// 点一次这个，云端清单就等于本机清单，之后各设备同步到的都是这一份。
+  ///
+  /// 做法：遍历云端目录里所有设备的同步文件，逐个改写 `sourceSubs` 段——
+  ///   - 本机那份写入**本机当前站源清单**；
+  ///   - 其余设备那份清空（它们的旧清单正是要清掉的东西）。
+  ///
+  /// 只动 `sourceSubs`，**追剧记录（records）与收藏/隐藏偏好（sourcePrefs）
+  /// 原样保留**。下次同步时云端并集 = 本机清单，对端随之对齐。
+  ///
+  /// 返回（改写文件数 / 清掉的云端条目数 / 本机清单条数）。
+  Future<({int files, int cleared, int local})> purgeRemoteSourceSubs() async {
+    final settings = store.webDavSettings;
+    if (!settings.configured) {
+      throw StateError('请先填写 WebDAV 服务器地址、账号和密码');
+    }
+    final directory = settings.directoryUri;
+    if (directory == null) {
+      throw StateError('同步地址无效：需要 http/https 地址，目录名仅限字母、数字、- 和 _');
+    }
+    if (store.locked) throw StateError('当前用户已锁定，请先解锁');
+
+    final localSubs = await _collectLocalSubs();
+    final localJson = <String, dynamic>{
+      for (final entry in localSubs.entries) entry.key: entry.value.toJson(),
+    };
+    final self = store.lanDocument.replica;
+
+    await transport.ensureDirectory(directory);
+    final remotes = await transport.list(directory);
+
+    var files = 0;
+    var cleared = 0;
+    final failures = <String>[];
+    for (final remote in remotes) {
+      if (remote.bytes > HttpWebDavTransport.fileLimit) continue;
+      // 只认同步文件：目录里可能有别的东西（备份、临时文件），不碰。
+      if (!remote.name.endsWith('.json')) continue;
+      final text = await transport.read(remote.uri);
+      if (utf8.encode(text).length > HttpWebDavTransport.fileLimit) continue;
+      Map<String, dynamic> payload;
+      try {
+        payload = Map<String, dynamic>.from(jsonDecode(text) as Map);
+      } on FormatException {
+        continue;
+      }
+      if (payload['schema'] != schema || payload['document'] is! Map) continue;
+      final document = Map<String, dynamic>.from(payload['document'] as Map);
+      final before = document['sourceSubs'];
+      final beforeCount = before is Map ? before.length : 0;
+      // 本机文件写本机清单，其余设备文件清空——并集后就是本机清单。
+      final isSelf = remote.name == '$self.json';
+      document['sourceSubs'] = isSelf ? localJson : <String, dynamic>{};
+      if (!isSelf) cleared += beforeCount;
+      payload['document'] = document;
+      payload['savedAt'] = _clock.call().toUtc().toIso8601String();
+      try {
+        await transport.write(remote.uri, jsonEncode(payload));
+      } catch (_) {
+        failures.add(remote.name);
+        continue;
+      }
+      files++;
+    }
+    if (failures.isNotEmpty) {
+      throw StateError('部分文件写入失败（${failures.join('、')}），请重试');
+    }
+    if (files == 0) throw StateError('云端没有可清理的同步文件');
+    return (files: files, cleared: cleared, local: localSubs.length);
+  }
+
   /// 收集本机已导入的 LibreTV / drpy 片源为订阅条目。
   ///
   /// 导入时间原生核心不记录，统一按 at=0 处理：对端条目（带同步时间戳）
@@ -373,7 +447,12 @@ class WebDavSynchronizer {
     try {
       for (final LibreTVSite site in await repository.libretvSites()) {
         if (site.key.isEmpty || site.api.trim().isEmpty) continue;
-        subs[site.sourceId] = LanSourceSub(name: site.name, api: site.api, at: 0);
+        // 规则源（XBPQ / 海阔 / Bili）：对端没有规则快照，要用规则地址
+        // 重建订阅条目（与原始订阅等价的单站点配置）；内联规则没有
+        // 规则地址，同步侧跳过（见 _autoImportSubs 的提示）。
+        final payload = site.isRule ? site.ruleSubscriptionJson : site.api;
+        if (payload.isEmpty) continue;
+        subs[site.sourceId] = LanSourceSub(name: site.name, api: payload, at: 0);
       }
     } catch (_) {}
     try {
@@ -403,10 +482,16 @@ class WebDavSynchronizer {
     }
     final warnings = <String>[];
     var imported = 0;
+    // 本机指纹：对端条目与本机不一致（地址 / 规则地址变了）时才重新导入，
+    // 避免每次同步都整批重导（重导会触发探测，代价高）。
+    final localFingerprints = await _localSubFingerprints();
     for (final entry in subs.entries) {
       final id = entry.key;
-      if (SourceSite.isKnown(id)) continue;
       final sub = entry.value;
+      if (SourceSite.isKnown(id)) {
+        final local = localFingerprints[id];
+        if (local == null || local == _incomingFingerprint(id, sub)) continue;
+      }
       final label = sub.name.trim().isEmpty ? id : sub.name.trim();
       try {
         if (id.startsWith('libretv:')) {
@@ -414,6 +499,7 @@ class WebDavSynchronizer {
             warnings.add('片源「$label」缺少采集地址，已跳过');
             continue;
           }
+          // 规则源同步过来的是单站点订阅 JSON（含规则地址），走同一导入链路。
           await repository.libretvImport(sub.api);
         } else if (id.startsWith('drpy:')) {
           if (sub.api.trim().isEmpty) {
@@ -446,6 +532,48 @@ class WebDavSynchronizer {
       store.notifySourceRegistryChanged();
     }
     return (imported: imported, warnings: warnings);
+  }
+
+  /// 本机片源的身份指纹：`api:<地址>` / `rule:<规则地址>` / `script:<脚本地址>`。
+  /// 与 [_incomingFingerprint] 同构，用于判断对端条目是否带来了改动。
+  Future<Map<String, String>> _localSubFingerprints() async {
+    final repository = this.repository;
+    final out = <String, String>{};
+    if (repository == null) return out;
+    try {
+      for (final site in await repository.libretvSites()) {
+        out[site.sourceId] = site.isRule
+            ? 'rule:${site.ruleUrl}'
+            : 'api:${site.api}';
+      }
+    } catch (_) {}
+    try {
+      for (final script in await repository.drpySites()) {
+        out[script.sourceId] = 'script:${script.scriptUrl}';
+      }
+    } catch (_) {}
+    return out;
+  }
+
+  /// 对端条目的指纹。规则源同步的是单站点订阅 JSON，需要从 `ext` 里取
+  /// 规则地址；普通采集站与脚本源直接用地址。
+  String _incomingFingerprint(String id, LanSourceSub sub) {
+    final api = sub.api.trim();
+    if (id.startsWith('drpy:')) return 'script:$api';
+    if (api.startsWith('{')) {
+      try {
+        final doc = jsonDecode(api);
+        final sites = doc is Map ? doc['sites'] : null;
+        if (sites is List && sites.isNotEmpty) {
+          final row = sites.first;
+          final ext = row is Map ? row['ext'] : null;
+          if (ext is String && ext.trim().isNotEmpty) {
+            return 'rule:${ext.trim()}';
+          }
+        }
+      } catch (_) {}
+    }
+    return 'api:$api';
   }
 
   void _record({required DateTime savedAt, String? error}) {

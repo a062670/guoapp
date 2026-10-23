@@ -1,5 +1,6 @@
 import base64
 import os
+import re
 from pathlib import Path
 import plistlib
 import runpy
@@ -87,6 +88,27 @@ class AppBuildTests(unittest.TestCase):
                     self.assertEqual('--all-sources' in package, enabled)
                     self.assertIn('--dart-define=ALL_SOURCES=' + str(enabled).lower(), flutter)
                     self.assertIn('core.buildAllSources=' + str(enabled).lower(), BuildVariant(enabled).linker_flags)
+
+    def test_build_number_flows_from_pubspec_into_flutter_defines(self):
+        """版本号唯一权威源是 pubspec.yaml 的 +N；构建脚本必须把它注入
+        BUILD_NUMBER，否则 lib/app_build.dart 回落到 defaultValue，启动
+        日志/关于页版本号停更（历史故障：包已 +138 仍显示 +80）。"""
+        pubspec = (Path(__file__).resolve().parents[1] / 'pubspec.yaml').read_text(encoding='utf-8')
+        match = re.search(r'^version:\s*\S+\+(\d+)\s*$', pubspec, re.MULTILINE)
+        self.assertIsNotNone(match, 'pubspec.yaml 缺少 version: x.y.z+N，构建号无从提取')
+        expected = '--dart-define=BUILD_NUMBER=' + match.group(1)
+        root = Path(__file__).resolve().parent
+        for target in ['android', 'windows']:
+            with self.subTest(target=target):
+                script = root / f'build_{target}.py'
+                with mock.patch.object(sys, 'argv', [str(script)]), \
+                        mock.patch.dict(os.environ, {'PATH': '/tools'}, clear=True), \
+                        mock.patch('shutil.which', return_value='/tools/flutter'), \
+                        mock.patch('subprocess.run') as run:
+                    runpy.run_path(str(script), run_name='__main__')
+                calls = [call.args[0] for call in run.call_args_list]
+                flutter = next(call for call in calls if 'build' in call)
+                self.assertIn(expected, flutter)
 
 
 if __name__ == '__main__':

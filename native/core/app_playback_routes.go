@@ -12,6 +12,9 @@ import (
 const nativePlaybackLimit = 8
 
 type nativePlaybackChoice struct {
+	// route 该组候选来自哪条取流线路（红果为 drpys/app/web/djapi，其它源为空）。
+	// 用于把播放层探活失败回流给线路健康度，打通两层。
+	route         string
 	danmakuSeries string
 	danmakuVideo  string
 	media         []providerMedia
@@ -22,7 +25,7 @@ type nativePlaybackChoice struct {
 }
 
 func nativePlaybackChoices(media providerMedia, quality int) nativePlaybackChoice {
-	choice := nativePlaybackChoice{qualities: []int{}}
+	choice := nativePlaybackChoice{qualities: []int{}, route: media.Route}
 	seen := map[string]bool{}
 	qualities := map[int]bool{}
 	for _, option := range append([]providerMedia{media}, media.Variants...) {
