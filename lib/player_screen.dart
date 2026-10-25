@@ -968,8 +968,28 @@ class _PlayerScreenState extends State<PlayerScreen>
       // 重新解析时回到默认线路：线路记忆是「当时可用」，默认线可能已经恢复。
       // 每次恢复只多一次解析请求（原本就要重新解析），不会额外增加风控压力。
       playbackRouteMemory.forget(widget.detail.drama);
+      if (!await _waitBeforeRefetch(_generation)) return;
     }
     await _play(_index, position: position, recoveryAction: action);
+  }
+
+  String get _refetchMessage =>
+      '正在重新获取播放地址（第 ${_recovery.refreshes}/${PlaybackRecovery.maxRefreshes} 次）';
+
+  Future<bool> _waitBeforeRefetch(int ticket) async {
+    final delay = _recovery.refreshDelay;
+    DiaryService.add(
+      '[Play] ${delay.inSeconds}s 后自动重试（第 ${_recovery.refreshes}/${PlaybackRecovery.maxRefreshes} 次）',
+    );
+    if (mounted && !_closed) {
+      setState(() {
+        _loading = true;
+        _error = null;
+        _loadingMessage = _refetchMessage;
+      });
+    }
+    await Future<void>.delayed(delay);
+    return mounted && !_closed && ticket == _generation;
   }
 
   void _togglePlayback() {
@@ -1158,7 +1178,7 @@ class _PlayerScreenState extends State<PlayerScreen>
       _videoHeight = 0;
       _loadingMessage = switch (recoveryAction) {
         PlaybackRecoveryAction.alternative => '正在切换备用线路',
-        PlaybackRecoveryAction.refresh => '正在重新获取播放地址',
+        PlaybackRecoveryAction.refresh => _refetchMessage,
         _ => '正在准备播放',
       };
     });
@@ -1316,12 +1336,31 @@ class _PlayerScreenState extends State<PlayerScreen>
           if (prepared != null) {
             await widget.repository.release(prepared.session);
           }
+          final localFailure =
+              (error is AppFailure && error.code == 'local_media') ||
+              (widget.localOnly && !_forceOnline);
+          if (!localFailure &&
+              mounted &&
+              !_closed &&
+              ticket == _generation &&
+              _recovery.refresh()) {
+            playbackRouteMemory.forget(widget.detail.drama);
+            if (await _waitBeforeRefetch(ticket)) {
+              unawaited(
+                _play(
+                  index,
+                  position: position,
+                  recoveryAction: PlaybackRecoveryAction.refresh,
+                  showControlsOnReady: showControlsOnReady,
+                ),
+              );
+            }
+            return;
+          }
           if (mounted && !_closed && ticket == _generation) {
             setState(() {
               _loading = false;
-              _localFailure =
-                  (error is AppFailure && error.code == 'local_media') ||
-                  (widget.localOnly && !_forceOnline);
+              _localFailure = localFailure;
               _error = error is AppFailure ? error.message : '无法播放这一集，请重试或换一集。';
               widget.handoff?.fail(_error!);
             });

@@ -10,24 +10,33 @@ void main() {
     routeCount: count,
   );
 
-  test('tries alternate routes before one fresh resolution, then stops', () {
+  test('tries alternate routes, then re-resolves up to three times', () {
     final recovery = PlaybackRecovery();
     expect(recovery.next(route(0)), PlaybackRecoveryAction.alternative);
     expect(recovery.next(route(1)), PlaybackRecoveryAction.alternative);
     expect(recovery.next(route(2)), PlaybackRecoveryAction.refresh);
+    expect(recovery.refreshes, 1);
+    expect(recovery.next(route(0)), PlaybackRecoveryAction.alternative);
+    expect(recovery.next(route(1)), PlaybackRecoveryAction.refresh);
+    expect(recovery.next(route(0)), PlaybackRecoveryAction.refresh);
+    expect(recovery.refreshes, 3);
     expect(recovery.next(route(0)), PlaybackRecoveryAction.stop);
     recovery.reset();
+    expect(recovery.refreshes, 0);
     expect(recovery.next(route(0)), PlaybackRecoveryAction.alternative);
   });
 
-  test('one-route sources refresh once without endless retrying', () {
+  test('one-route sources re-resolve three times, then stop', () {
     final recovery = PlaybackRecovery();
-    expect(recovery.next(route(0, count: 1)), PlaybackRecoveryAction.refresh);
+    for (var i = 1; i <= 3; i++) {
+      expect(recovery.next(route(0, count: 1)), PlaybackRecoveryAction.refresh);
+      expect(recovery.refreshDelay, Duration(seconds: i));
+    }
     expect(recovery.next(route(0, count: 1)), PlaybackRecoveryAction.stop);
     expect(recovery.next(route(0, count: 1)), PlaybackRecoveryAction.stop);
   });
 
-  test('many failing alternatives cannot exceed the automatic retry limit', () {
+  test('alternatives are capped before re-resolving', () {
     final recovery = PlaybackRecovery();
     for (var i = 0; i < 3; i++) {
       expect(
@@ -35,7 +44,16 @@ void main() {
         PlaybackRecoveryAction.alternative,
       );
     }
-    expect(recovery.next(route(3, count: 10)), PlaybackRecoveryAction.stop);
+    expect(recovery.next(route(3, count: 10)), PlaybackRecoveryAction.refresh);
+  });
+
+  test('load failures share the same three re-resolutions', () {
+    final recovery = PlaybackRecovery();
+    expect(recovery.refresh(), isTrue);
+    expect(recovery.refresh(), isTrue);
+    expect(recovery.refresh(), isTrue);
+    expect(recovery.refresh(), isFalse);
+    expect(recovery.next(route(0, count: 1)), PlaybackRecoveryAction.stop);
   });
 
   test('a route remembered at the last index wraps back to the first', () {
@@ -45,7 +63,7 @@ void main() {
     expect(recovery.next(route(0)), PlaybackRecoveryAction.alternative);
     // 1 → 下一条 2 已试过，转入重新解析；刷新后各线路可再试一遍。
     expect(recovery.next(route(1)), PlaybackRecoveryAction.refresh);
-    expect(recovery.next(route(0)), PlaybackRecoveryAction.stop);
+    expect(recovery.next(route(0)), PlaybackRecoveryAction.alternative);
   });
 
   test(
