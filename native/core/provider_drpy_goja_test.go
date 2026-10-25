@@ -157,3 +157,74 @@ func TestDrpyReqFailurePropagates(t *testing.T) {
 		t.Fatalf("req 失败应透出，得到 %v", err)
 	}
 }
+
+// [+145] drpyBlockedTarget 表驱动：环回 / 内网 / 链路本地 / localhost /
+// 非 http(s) 一律拒绝；公网 IPv4、IPv6、域名放行。防恶意或被黑源脚本借
+// 用户设备扫内网（SSRF），重定向每一跳由 fetch 的 CheckRedirect 包装复查。
+func TestDrpyBlockedTarget(t *testing.T) {
+	blocked := []string{
+		"http://127.0.0.1:8080/x",
+		"http://127.1.2.3/x",
+		"http://localhost/x",
+		"https://LOCALHOST/x",
+		"http://foo.localhost/x",
+		"http://10.1.2.3/x",
+		"http://172.16.0.1/x",
+		"http://172.31.255.255/x",
+		"http://192.168.1.1:80/admin",
+		"http://169.254.169.254/latest/meta-data",
+		"http://[::1]/x",
+		"http://[::ffff:192.168.1.1]/x",
+		"http://[fe80::1]/x",
+		"http://0.0.0.0/x",
+		"ftp://example.com/x",
+		"file:///etc/passwd",
+		"not a url",
+		"http:///x",
+	}
+	for _, target := range blocked {
+		if err := drpyBlockedTarget(target); err == nil {
+			t.Errorf("应被拒绝: %q", target)
+		}
+	}
+	allowed := []string{
+		"http://example.com/x",
+		"https://api.example.com:8442/v1?id=1",
+		"https://8.8.8.8/x",
+		"https://172.32.0.1/x",
+		"https://[2606:4700:4700::1111]/x",
+	}
+	for _, target := range allowed {
+		if err := drpyBlockedTarget(target); err != nil {
+			t.Errorf("应放行 %q: %v", target, err)
+		}
+	}
+}
+
+// [+145] 端到端：夹具默认放行环回（httptest 所需），显式关掉放行模拟生产
+// （drpyAllowLocalTargets 恒 false）后，脚本 req 打环回地址必须被 SSRF
+// guard 拦截——证明防护在真实脚本路径上生效，而不只是纯函数层面。
+func TestDrpyScriptLoopbackReqBlocked(t *testing.T) {
+	engine := sourceFixtureEngine(t, func(request *http.Request) (*http.Response, error) {
+		t.Error("guard 生效时不应触达传输层")
+		return sourceFixtureResponse(request, 200, "unreachable"), nil
+	})
+	engine.downloader.drpyAllowLocalTargets = false
+	script := strings.ReplaceAll(drpyBrowseScript, "__HOST__", "http://127.0.0.1:1")
+	if _, err := engine.importDrpyScript(context.Background(), script, ""); err != nil {
+		t.Fatalf("导入失败: %v", err)
+	}
+	list := engine.drpySiteList()
+	if len(list) != 1 {
+		t.Fatalf("导入后应有 1 个站点: %+v", list)
+	}
+	key := list[0]["key"].(string)
+	site, ok := engine.downloader.drpySite(drpySourceID(key))
+	if !ok {
+		t.Fatalf("找不到导入的站点 %q", key)
+	}
+	_, _, err := engine.downloader.fetchDrpyCatalogPage(context.Background(), site, 1, "1", "")
+	if err == nil || !strings.Contains(err.Error(), "环回") {
+		t.Fatalf("环回目标应被 SSRF guard 拦截，得到 %v", err)
+	}
+}

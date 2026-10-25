@@ -20,6 +20,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -171,10 +172,50 @@ func drpyExportOptions(value goja.Value) map[string]any {
 	return options
 }
 
+// drpyBlockedTarget [+145] 拒绝脚本请求环回 / 内网 / 链路本地目标，防止恶意
+// 或被黑源脚本借用户设备扫内网（SSRF）。只拦 URL 字面量：公网域名经正常 DNS
+// 解析，防 DNS 重绑定需 dial 层管控，代价不成比例，不在此函数范围。
+// 边界：自建在内网的源（私有部署）会被误伤——安全与私有部署便利二选一，
+// 优先安全；确有私有部署需求再议配置化放行，不要直接删本函数。
+func drpyBlockedTarget(target string) error {
+	parsed, err := url.Parse(target)
+	if err != nil {
+		return errors.New("req 目标地址无效")
+	}
+	if parsed.Scheme != "http" && parsed.Scheme != "https" {
+		return errors.New("req 仅支持 http/https 目标")
+	}
+	host := parsed.Hostname()
+	if host == "" {
+		return errors.New("req 缺少主机名")
+	}
+	if strings.EqualFold(host, "localhost") || strings.HasSuffix(strings.ToLower(host), ".localhost") {
+		return errors.New("req 不允许访问本机地址")
+	}
+	if ip := net.ParseIP(host); ip != nil &&
+		(ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() ||
+			ip.IsLinkLocalMulticast() || ip.IsInterfaceLocalMulticast() || ip.IsUnspecified()) {
+		return errors.New("req 不允许访问环回 / 内网 / 链路本地地址")
+	}
+	return nil
+}
+
 // drpyFetch 同步阻塞拉取：HTTP 走 Downloader client（代理/UA/限流全继承），
 // 当前 JS 线程阻塞等待结果，全程不跨 goroutine 操作 vm。ctx 超时由
 // drpyInvoke 的看门狗 cancel 触发。
 func (host *drpyHost) fetch(target string, options map[string]any) (drpyResponse, error) {
+	// [+145] SSRF 防护：首跳目标先过检查（重定向每一跳在下方 CheckRedirect
+	// 包装里复查，堵住「公网 302 弹内网」的绕过）。drpyAllowLocalTargets
+	// 仅测试夹具打开（httptest 绑 127.0.0.1），生产恒false。
+	guard := func(address string) error {
+		if host.downloader.drpyAllowLocalTargets {
+			return nil
+		}
+		return drpyBlockedTarget(address)
+	}
+	if err := guard(target); err != nil {
+		return drpyResponse{}, err
+	}
 	method := strings.ToUpper(drpyOptionString(options, "method"))
 	if method == "" {
 		method = http.MethodGet
@@ -217,7 +258,21 @@ func (host *drpyHost) fetch(target string, options map[string]any) (drpyResponse
 		}
 		defer release()
 	}
-	response, err := drpyGuardedClient(host.ctx, host.downloader.client).Do(request)
+	// [+145] 包装重定向：沿用 downloader.client 的基础策略（次数上限、跨 host
+	// 剥 X-Preview-Token），逐跳再跑一遍目标检查。模式同
+	// network_media_credentials.go 的 providerMediaCredentials.client()。
+	scoped := *host.downloader.client
+	previousRedirect := scoped.CheckRedirect
+	scoped.CheckRedirect = func(request *http.Request, via []*http.Request) error {
+		if err := guard(request.URL.String()); err != nil {
+			return err
+		}
+		if previousRedirect != nil {
+			return previousRedirect(request, via)
+		}
+		return nil
+	}
+	response, err := drpyGuardedClient(host.ctx, &scoped).Do(request)
 	if err != nil {
 		return drpyResponse{}, err
 	}

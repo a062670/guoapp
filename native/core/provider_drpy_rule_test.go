@@ -221,6 +221,8 @@ func drpyFixtureEngine(t *testing.T, fixture *libretvFixture) *nativeEngine {
 	engine.downloader.client.Transport = fixtureTransport{server: fixture.server}
 	engine.downloader.limiter = newRequestLimiter(3, 0)
 	engine.downloader.cfg.Retries = 1
+	// [+145] httptest 绑 127.0.0.1，夹具放行 SSRF guard（生产不设）。
+	engine.downloader.drpyAllowLocalTargets = true
 	return engine
 }
 

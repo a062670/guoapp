@@ -17,10 +17,13 @@ import (
 )
 
 type Config struct {
-	dataDir          string
-	MaxPagesPerSort  int
-	PageSize         int
-	Retries          int
+	dataDir         string
+	MaxPagesPerSort int
+	PageSize        int
+	Retries         int
+	// InsecureTLS 仅测试夹具使用（network_media_test.go 的自签证书服务器），
+	// 桥接层与用户配置均不设置，生产恒为 false。勿在新代码里接它开
+	// InsecureSkipVerify（+145：野果客户端的同款死分支已删）。
 	InsecureTLS      bool
 	HuangguoAIURL    string
 	HuangguoVideoURL string
@@ -45,8 +48,13 @@ type Config struct {
 }
 
 type Downloader struct {
-	rankings              rankingCache
-	cfg                   Config
+	rankings rankingCache
+	cfg      Config
+	// drpyAllowLocalTargets [+145] 放开 drpyBlockedTarget 的环回/内网拦截，
+	// 仅供测试夹具（httptest 服务器必绑 127.0.0.1，见 app_sources_test.go 的
+	// sourceFixture*）。生产恒 false：桥接层不设置它，SSRF 防护对用户导入的
+	// 第三方源脚本始终生效。细节见 provider_drpy_goja.go 的 fetch。
+	drpyAllowLocalTargets bool
 	client                *http.Client
 	huangdouDetails       map[string]huangdouDetailEntry
 	huangdouDetailPending map[string]*huangdouDetailCall

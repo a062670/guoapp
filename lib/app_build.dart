@@ -5,5 +5,8 @@ const appSlug = allSourcesEnabled ? 'zhenguojian' : 'hongguojian';
 // （见 scripts/app_build.py build_number_from_pubspec），不要手动维护此文件
 // 与 pubspec 两处；defaultValue 仅兜底绕过构建脚本直接 flutter build 的
 // 场景，发新版本时若误触该路径，日志/关于页会显示这里的旧值。
-const duanjuBuildNumber = int.fromEnvironment('BUILD_NUMBER', defaultValue: 138);
+const duanjuBuildNumber = int.fromEnvironment(
+  'BUILD_NUMBER',
+  defaultValue: 145,
+);
 const appPackageId = 'com.duanju.duanju_app';

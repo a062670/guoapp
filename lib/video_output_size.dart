@@ -14,6 +14,23 @@ Size? videoDisplaySize(VideoParams parameters) {
       : Size(width.toDouble(), height.toDouble());
 }
 
+/// 安卓固定输出表面的默认策略（实现见 media_kit_video 的 [VideoFixedSurface]）。
+///
+/// 取值口径：
+/// - `maxScale 2.0`：与 Anime4K 链的 2× 内部渲染对齐；
+/// - `maxPixels 3686400`（2560×1440）：1080p 片源可放大到 2K 级别，
+///   同时挡住 4K 片源无限放大；
+/// - `maxDimension 2560`：极端宽高比（如 9:32 竖屏短片）的单边兜底。
+///
+/// 调大 maxPixels / maxDimension 可换取更高上限的表面，代价是填充率与显存；
+/// 真正的瓶颈通常在 video_enhancement_policy.dart 的安卓显存预算（128MB），
+/// 源分辨率越大越容易被预算拦下（见 README「画质增强」章节）。
+const androidFixedSurfacePolicy = VideoFixedSurface(
+  maxScale: 2.0,
+  maxPixels: 3686400,
+  maxDimension: 2560,
+);
+
 /// 画质增强的"输出表面尺寸"适配器。
 ///
 /// ## 平台差异（2026-10 移植修复的核心结论）
@@ -54,19 +71,35 @@ Size? videoDisplaySize(VideoParams parameters) {
 ///
 /// ## 为什么不放大会表面也有超分效果
 ///
-/// Anime4K 链（+87 起为轻量档 7 文件链，见
+/// Anime4K 链（+87 起为精细档 7 文件链，+144 前名轻量档，见
 /// lib/video_enhancement_assets.dart 的 animeChain）按 WHEN 指令分平台生效：
-/// 安卓端表面恒为视频显示尺寸（OUTPUT≡MAIN），mpv 自动跳过全部 Upscale /
-/// AutoDownscalePre pass，仅 Clamp_Highlights + Restore_CNN 生效——这是
-/// **同分辨率重建/降噪**（去压缩噪点、重建线条），也是安卓端唯一
-/// 生效的形态；桌面端表面仍放大 2×（WHEN 为真），Upscale 链全生效，
+/// 默认形态下安卓端表面恒为视频显示尺寸（OUTPUT≡MAIN），mpv 自动跳过全部
+/// Upscale / AutoDownscalePre pass，仅 Clamp_Highlights + Restore_CNN 生效——
+/// 这是**同分辨率重建/降噪**（去压缩噪点、重建线条），也是安卓端默认
+/// 唯一生效的形态；桌面端表面仍放大 2×（WHEN 为真），Upscale 链全生效，
 /// 内部按 2× 源渲染、Depth-to-Space 输出后由 mpv 缩放到表面。
 /// 两条路径都只 `change-list glsl-shaders set`，不动表面尺寸。
 ///
-/// 若未来确需表面放大：只能在 `VideoController` 创建时通过
-/// `VideoControllerConfiguration` 一次性指定 width/height，播放中改必踩上述
-/// 三个问题；届时需同步调整 video_enhancement_policy 的 output 语义与
-/// video_enhancement.dart `_monitor` 的 sizeMatches 校验。
+/// ## 默认形态下如何放大表面（已落地：VideoFixedSurface）
+///
+/// 真机验证过：播放中改表面必踩上方三个问题，因此放大只能在
+/// `VideoController` 创建时一次性指定——宿主给
+/// `VideoControllerConfiguration.fixedSurface` 传一个
+/// [VideoFixedSurface] 策略（纯数据），fork 在**首次** videoParams 事件上
+/// 按「源尺寸 × 倍率」放大表面并锁定，不新增任何调用时机，三个连锁问题
+/// 均不会触发。倍率按源尺寸（而非屏幕尺寸）计算以保持视频宽高比，否则
+/// mpv 黑边 + Flutter `FittedBox(contain)` 会把视频挤成中央一小块。
+///
+/// 约束（均已在代码/注释中固化）：
+/// - 表面只在播放器创建时锁定一次。竖屏进入后旋转横屏不会重新放大
+///   （重新 SetSurfaceSize 就是播放中改表面，会转圈），该次会话只剩
+///   同分辨率重建；中途把增强从「关」改到「开」同理，需退出重进播放器。
+/// - 放大表面后，video_enhancement.dart 的 `_monitor` 用
+///   `expectsUpscale` 强制要求 Anime4K 链出现 `Depth-to-Space` 末 pass
+///   （极简档无 Upscale 链，不强制，否则必误报 render-pass），防止
+///   Upscale 仍被 WHEN 跳过却误报成功。
+/// - 增强策略侧（video_enhancement_policy.dart）拿到的 surfaceOutput 即
+///   实际表面尺寸，与 fork 应用的值恒等，sizeMatches 才不会误拉黑后端。
 class VideoOutputSizeAdapter {
   VideoOutputSizeAdapter(this.video, {required this.onFailure});
 
@@ -98,7 +131,8 @@ class VideoOutputSizeAdapter {
   /// 设置增强期望的输出表面尺寸。
   ///
   /// [移植改造] 安卓端整体为 no-op：表面尺寸交给 media_kit 自身维护
-  /// （其 videoParamsSubscription 会把表面同步为视频显示尺寸 dw×dh）。
+  /// （其 videoParamsSubscription 会把表面同步为视频显示尺寸 dw×dh；宿主
+  /// 启用固定表面后同步为「源尺寸 × 倍率」的一次性锁定值，见类注释）。
   /// 期望值仍记录在 [_target] 中供诊断/将来使用，但绝不触碰表面。
   /// 桌面端行为与上游完全一致（仅在尺寸真正变化时调用 setSize）。
   Future<void> setTarget(Size? value) async {

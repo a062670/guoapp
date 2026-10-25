@@ -36,6 +36,7 @@ import 'sources_screen.dart';
 import 'lan_controller.dart';
 import 'lan_screen.dart';
 import 'video_enhancement.dart';
+import 'video_enhancement_preferences.dart';
 import 'video_output_size.dart';
 import 'webview_sniffer.dart';
 
@@ -168,6 +169,35 @@ class _PlayerScreenState extends State<PlayerScreen>
           defaultTargetPlatform == TargetPlatform.iOS);
   VideoEnhancementController? get _enhancementForUi =>
       _enhancement.supported ? _enhancement : null;
+
+  /// 是否需要为安卓固定（放大）输出表面；返回策略或 null（交还 media_kit
+  /// 自身维护，表面恒等于视频显示尺寸，与上游行为一致）。
+  ///
+  /// 命中条件全部满足才启用：
+  /// 1. 安卓——fork 的实现只在安卓控制器里生效（桌面走 setSize 动态放大）；
+  /// 2. 本页面自建 VideoController（videoBuilder 为空）；
+  /// 3. media_kit/libmpv 后端——LunaExoPlayer 等没有 glsl-shaders 注入点，
+  ///    放大表面纯属浪费；
+  /// 4. 非电视端——电视端走原生硬件直通，放大表面只会白耗 GPU；
+  /// 5. 增强未关闭——关闭时锁大表面没有任何收益。
+  ///
+  /// ⚠️ 表面只在播放器创建时锁定一次：竖屏进入后旋转横屏不会重新放大
+  /// （播放中改表面会触发 VO 重建 + seek 转圈，见 video_output_size.dart
+  /// 类注释），该次会话只剩同分辨率重建；中途把增强从「关」改到「开」
+  /// 同理，需退出重进播放器。
+  VideoFixedSurface? _fixedSurfacePolicy(
+    VideoEnhancementPreferences enhancement,
+  ) {
+    if (!Platform.isAndroid) return null;
+    if (widget.videoBuilder != null) return null;
+    if (_player.platform is! NativePlayer) return null;
+    // AppLayout.isTelevision 需要 InheritedWidget，initState 里不可用；
+    // main() 在 runApp 前已 await 过 AppDevice.detect，缓存必然就绪。
+    if (AppDevice.cached?.television ?? false) return null;
+    if (enhancement.mode == VideoEnhancementMode.off) return null;
+    return androidFixedSurfacePolicy;
+  }
+
   PlaybackPreferences get _preferences => PlaybackPreferences(
     speed: _speed,
     holdSpeed: _holdSpeed,
@@ -237,11 +267,18 @@ class _PlayerScreenState extends State<PlayerScreen>
         );
     // media_kit (libmpv) 是唯一能解密红果 CENC 内容的路径：video_player 插件
     // 不提供 DRM 接口，ExoPlayer 拿到加密数据后既无法解密也不会报错，只会卡住。
+    final fixedSurface = _fixedSurfacePolicy(preferences.enhancement);
     _video = widget.videoBuilder == null
         ? VideoController(
             _player,
             configuration: VideoControllerConfiguration(
               enableHardwareAcceleration: !Platform.isIOS,
+              // [安卓固定表面] 仅安卓生效：fork 在首次 videoParams 事件上把
+              // 渲染表面一次性放大到「源尺寸 × 倍率」并锁定，让 Anime4K 的
+              // Upscale pass 真正参与渲染（1080p → 2K 的真超分）。
+              // 桌面/iOS 传 null，行为与上游 media_kit_video 完全一致。
+              // 原理与三个已踩过的坑见 video_output_size.dart 类注释。
+              fixedSurface: fixedSurface,
             ),
           )
         : null;
@@ -251,6 +288,10 @@ class _PlayerScreenState extends State<PlayerScreen>
       preferences: preferences.enhancement,
       category: widget.detail.drama.category,
       tags: widget.detail.drama.tags,
+      // 与上面同一个策略对象：增强侧据此读取 fork 实际应用的表面尺寸参与
+      // 决策，_monitor 的 sizeMatches 才能成立（见
+      // VideoEnhancementController._fixedSurfaceSize）。
+      fixedSurface: fixedSurface,
     );
     _interactions = PlayerInteractions(
       player: _player,

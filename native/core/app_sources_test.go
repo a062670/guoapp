@@ -28,7 +28,9 @@ func sourceFixtureResponse(request *http.Request, status int, body string) *http
 func sourceFixtureDownloader(t *testing.T, transport sourceFixtureTransport) *Downloader {
 	t.Helper()
 	return &Downloader{cfg: Config{dataDir: t.TempDir(), Retries: 1, PageSize: 30, MaxPagesPerSort: 1},
-		client: &http.Client{Transport: transport}, limiter: newRequestLimiter(3, 0), providerHosts: map[string]string{}}
+		// [+145] httptest 服务器绑 127.0.0.1，夹具放行 SSRF  guard（生产不设）。
+		drpyAllowLocalTargets: true,
+		client:                &http.Client{Transport: transport}, limiter: newRequestLimiter(3, 0), providerHosts: map[string]string{}}
 }
 
 func sourceFixtureEngine(t *testing.T, transport sourceFixtureTransport) *nativeEngine {
@@ -41,6 +43,8 @@ func sourceFixtureEngine(t *testing.T, transport sourceFixtureTransport) *native
 	engine.downloader.client.Transport = transport
 	engine.downloader.limiter = newRequestLimiter(3, 0)
 	engine.downloader.cfg.Retries = 1
+	// [+145] 同 sourceFixtureDownloader：夹具放行环回目标。
+	engine.downloader.drpyAllowLocalTargets = true
 	return engine
 }
 

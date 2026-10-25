@@ -21,6 +21,7 @@ class VideoEnhancementController extends ChangeNotifier {
     required VideoEnhancementPreferences preferences,
     required String category,
     required List<String> tags,
+    this.fixedSurface,
   }) : _preferences = preferences,
        _animationHint = videoHasAnimationTags(category, tags) {
     final native = player.platform;
@@ -68,6 +69,26 @@ class VideoEnhancementController extends ChangeNotifier {
   static const _device = MethodChannel('duanju/device');
   static const _filterLabel = 'duanju_vsr';
   final Player player;
+
+  /// [guoguo fork] 固定输出表面策略（安卓端真超分的开关，null = 上游行为）。
+  ///
+  /// 由 player_screen 在满足全部条件时下发（见 PlayerScreen._fixedSurfacePolicy）。
+  /// fork（packages/media_kit_video）会在**首次** videoParams 事件上按该策略把
+  /// 渲染表面一次性放大到「源尺寸 × 倍率」并锁定，本类据此读取实际表面尺寸
+  /// （见 [_fixedSurfaceSize]）参与决策——表面对不上时 _monitor 的 sizeMatches
+  /// 会连续不成立，5 次即 _failBackend 把后端拉黑。
+  final VideoFixedSurface? fixedSurface;
+
+  /// 固定表面模式下 fork **实际应用**的表面尺寸（未启用/尚未应用时为 null）。
+  ///
+  /// 为什么不自己按公式算：片源分辨率变化（切清晰度、自适应码率）后，公式
+  /// 算出的期望尺寸会与 fork 已锁定的表面对不上，sizeMatches 连续不成立会把
+  /// 后端误拉黑。rect 是 fork 应用表面后回传的唯一事实来源，锁定后永不变化，
+  /// 天然与 sizeMatches 一致；表面对不上当前源时（新源更大）expectsUpscale 也
+  /// 会正确地不为真，与 mpv 跳过 Upscale 的实际行为对齐。
+  Size? get _fixedSurfaceSize =>
+      fixedSurface == null ? null : _output?.actualSize;
+
   late final bool supported;
   final bool _animationHint;
   VideoEnhancementPreferences _preferences;
@@ -100,7 +121,16 @@ class VideoEnhancementController extends ChangeNotifier {
   /// decision 不含 tier（档位只换链、不换后端/尺寸），播放中切档位时
   /// `selected == _applied` 仍成立，需靠本字段识别「同后端不同链」
   /// 从而触发重注；非 anime 后端无所谓档位。
-  VideoEnhancementTier _appliedTier = VideoEnhancementTier.lite;
+  VideoEnhancementTier _appliedTier = VideoEnhancementTier.balanced;
+
+  /// [阶梯降档·2026-10 +142] 本播放会话的档位覆盖，仅由 _watchPerformance
+  /// 过载降档写入，null 表示按用户偏好。刻意不做持久化：降档是「这一集跑
+  /// 不动」的临时让让，不该悄悄改掉用户保存的偏好；用户在设置页动过任何
+  /// 选项（setPreferences）或换集（beforeMedia）即清除，回到用户的选择。
+  VideoEnhancementTier? _tierOverride;
+
+  /// 实际应注入的档位：会话级降档覆盖优先，否则用户偏好。
+  VideoEnhancementTier get _effectiveTier => _tierOverride ?? _preferences.tier;
   VideoEnhancementBackend? _applyingBackend;
   bool _ready = false;
   bool _initialized = false;
@@ -147,14 +177,15 @@ class VideoEnhancementController extends ChangeNotifier {
   String get status => _status;
   String get contentLabel => animation ? '当前按动漫增强' : '当前按通用画面增强';
   String get detail {
-    // [文案·2026-10] 安卓端表面恒为源尺寸（+82 决策），dimensions 恒为
-    // 「同 → 同」，叠加「安卓端按源尺寸呈现，超分在渲染链内部完成」的内部
-    // 渲染说明反而容易被误读为未生效。按产品要求：安卓端神经增强（cost≥3）
+    // [文案·2026-10] 安卓端默认表面恒为源尺寸（+82 决策），启用固定表面后
+    // 表面可大于源，但「源 × → 表面 ×」的尺寸对比 + 「超分在渲染链内部完成」
+    // 的说明叠加仍容易被误读为未生效。按产品要求：安卓端神经增强（cost≥3）
     // 只呈现一句结果文案，不再展示尺寸对比与内部渲染说明；其余平台/后端
     // （桌面端放大、ravu 缩放等）维持原 dimensions 展示。
     if (Platform.isAndroid && (_applied?.backend.cost ?? 0) >= 3) {
       return [
-        // 三档在安卓端都是同分辨率重建/降噪，文案按 +88 的产品要求统一。
+        // 三档在安卓端默认都是同分辨率重建/降噪；固定大表面启用后 Upscale
+        // 链参与渲染，但文案按 +88 的产品要求仍统一为这一句。
         '已执行超分降噪',
         if (_downgradeReason.isNotEmpty) _downgradeReason,
         // [诊断·2026-10] 最近一次增强失败的技术细节（阶段/尺寸比对/渲染链
@@ -194,6 +225,8 @@ class VideoEnhancementController extends ChangeNotifier {
     _preferences = value;
     _comparing = false;
     _costLimit = 4;
+    // 用户主动改设置 = 新的一次尝试：本集的自动降档覆盖作废，回到用户所选。
+    _tierOverride = null;
     _rejected.clear();
     _downgradeReason = '';
     _lastFailure = '';
@@ -237,6 +270,8 @@ class VideoEnhancementController extends ChangeNotifier {
     _revision++;
     _debounce?.cancel();
     _costLimit = 4;
+    // 换集 = 全新会话，上一集的阶梯降档不带过来。
+    _tierOverride = null;
     _downgradeReason = '';
     _lastFailure = '';
     // [诊断·2026-10] 换集 = 全新播放会话，上一集的失败现场不带过来。
@@ -328,6 +363,7 @@ class VideoEnhancementController extends ChangeNotifier {
       rate: player.state.rate,
       costLimit: _costLimit,
       rejected: _rejected,
+      fixedSurface: _fixedSurfaceSize,
       opaque8Bit: _opaque8Bit,
     );
     final selected = _comparing && canCompare
@@ -341,7 +377,7 @@ class VideoEnhancementController extends ChangeNotifier {
     // 必须重注；其他后端切 tier 无意义，保持提前返回避免无谓重注入。
     final tierMatters = selected.backend == VideoEnhancementBackend.anime;
     if (selected == _applied &&
-        (!tierMatters || _appliedTier == _preferences.tier)) {
+        (!tierMatters || _appliedTier == _effectiveTier)) {
       _publishStatus();
       return;
     }
@@ -356,12 +392,22 @@ class VideoEnhancementController extends ChangeNotifier {
         VideoEnhancementBackend.fsrcnnx => <String>[
           VideoEnhancementAssets.fsrcnnx,
         ],
-        // [档位·2026-10] 高级档按 tier 选链：质量档=VL 链，
-        // 轻量档=M/S 链（+87 默认）。两链 WHEN 均保留，平台筛选由 mpv 完成。
-        VideoEnhancementBackend.anime => switch (_preferences.tier) {
-          VideoEnhancementTier.quality => VideoEnhancementAssets.animeChainQuality,
-          VideoEnhancementTier.minimal => VideoEnhancementAssets.animeChainMinimal,
-          VideoEnhancementTier.lite => VideoEnhancementAssets.animeChainLite,
+        // [档位·2026-10] 按 tier 选链：质量档=VL 链，精细档=M/S 链
+        // （+87 引入；+144 起默认档为均衡档）。两链 WHEN 均保留，平台筛选由 mpv 完成。
+        // [阶梯降档·+142] 用 _effectiveTier 而非 _preferences.tier：看门狗
+        // 降档只改会话级覆盖，用户保存的偏好不变（见 _tierOverride 注释）。
+        VideoEnhancementBackend.anime => switch (_effectiveTier) {
+          VideoEnhancementTier.quality =>
+            VideoEnhancementAssets.animeChainQuality,
+          VideoEnhancementTier.fine => VideoEnhancementAssets.animeChainFine,
+          VideoEnhancementTier.standard =>
+            VideoEnhancementAssets.animeChainStandard,
+          VideoEnhancementTier.balanced =>
+            VideoEnhancementAssets.animeChainBalanced,
+          VideoEnhancementTier.minimalUpscale =>
+            VideoEnhancementAssets.animeChainMinimalUpscale,
+          VideoEnhancementTier.minimal =>
+            VideoEnhancementAssets.animeChainMinimal,
         },
         _ => null,
       };
@@ -399,7 +445,7 @@ class VideoEnhancementController extends ChangeNotifier {
         }
       }
       _applied = selected;
-      _appliedTier = _preferences.tier;
+      _appliedTier = _effectiveTier;
       _confirmationMisses = 0;
       _confirmed = selected.backend == VideoEnhancementBackend.original;
       ignorePerformance();
@@ -737,6 +783,11 @@ class VideoEnhancementController extends ChangeNotifier {
         _schedule();
         return;
       }
+      // 固定表面模式下，策略层认定的 output 必须与 fork 实际应用的表面一致，
+      // 因此这里与 _apply 共用同一个取值（_fixedSurfaceSize = fork 已应用的
+      // 表面尺寸），否则 reassessed 与 selected 会无限互斥、sizeMatches 也会
+      // 连续不成立把后端误拉黑。
+      final fixed = _fixedSurfaceSize;
       final reassessed = chooseVideoEnhancement(
         preferences: _preferences,
         parameters: player.state.videoParams,
@@ -752,6 +803,7 @@ class VideoEnhancementController extends ChangeNotifier {
         rate: player.state.rate,
         costLimit: _costLimit,
         rejected: _rejected,
+        fixedSurface: fixed,
         opaque8Bit: _opaque8Bit,
       );
       if (!_comparing && reassessed != selected) {
@@ -792,6 +844,23 @@ class VideoEnhancementController extends ChangeNotifier {
           surfaceHeight is num &&
           (surfaceWidth - selected.output!.width).abs() <= 2 &&
           (surfaceHeight - selected.output!.height).abs() <= 2;
+      final sourceSize = videoDisplaySize(player.state.videoParams);
+      // 极简档链只有 Clamp + Restore_S，没有 Upscale/Depth-to-Space；固定
+      // 大表面下它只是「重建 + spline36 放大到表面」，若仍按含超分链的
+      // 档位要求 Depth-to-Space，会必然误报 render-pass（+141 真机实证：
+      // 期望/表面/osd 均为 2560×1440、尺寸匹配，但链内无 Depth-to-Space，
+      // passes 只有 De-Ring + Restore_S，即极简档）。
+      // 用 _appliedTier（实际注入的链）而非 _preferences.tier（可能刚切档
+      // 尚未重注），保证期望与链内容一致。
+      // （+143 极简超分档带 Upscale_Denoise_S 链，expectsUpscale 为 true，
+      // 仍按 Depth-to-Space 判定；六档里只有极简档无超分链。）
+      final expectsUpscale =
+          fixed != null &&
+          _appliedTier != VideoEnhancementTier.minimal &&
+          selected.output != null &&
+          sourceSize != null &&
+          (selected.output!.width > sourceSize.width + 2 ||
+              selected.output!.height > sourceSize.height + 2);
       final effectFound = switch (selected.backend) {
         VideoEnhancementBackend.ravu => descriptions.contains(
           _luma ? 'RAVU-Lite-AR (step2' : 'RAVU (step4',
@@ -802,9 +871,14 @@ class VideoEnhancementController extends ChangeNotifier {
           // 仅 Clamp + Restore_CNN 生效（pass 描述含 Restore）。二者有其一
           // 即视为链已加载，避免把安卓端的正常 Restore 形态误判为未生效
           // （+95 极简档只有 Clamp + Restore_S，同样命中 Restore）。
+          // 固定大表面启用后，输出大于源时必须见到 Depth-to-Space（极简档
+          // 无 Upscale 链，expectsUpscale 已置 false，见上），否则说明
+          // Upscale 仍被 WHEN 跳过，不能仅凭 Restore 判为成功。
           descriptions.contains('Anime4K') &&
-              (descriptions.contains('Depth-to-Space') ||
-                  descriptions.contains('Restore')),
+              (expectsUpscale
+                  ? descriptions.contains('Depth-to-Space')
+                  : (descriptions.contains('Depth-to-Space') ||
+                        descriptions.contains('Restore'))),
         VideoEnhancementBackend.fsrcnnx =>
           descriptions.contains('feature map') &&
               descriptions.contains('aggregation'),
@@ -922,7 +996,15 @@ class VideoEnhancementController extends ChangeNotifier {
     final p95 = samples.isEmpty
         ? 0.0
         : samples[((samples.length - 1) * .95).ceil()];
-    var overloaded = samples.length >= 5 && p95 > 1000 / fps / state.rate * .25;
+    // [阈值修正·+142] 旧判据是 `p95 > 帧间隔 × 25%` 单独即可触发过载：
+    // 骁龙 865 上 7 个 pass 的极简档就会越过 8.3ms（30fps），即便渲染只占
+    // 帧间隔 60%、稳跑满帧率也被判超载，10 秒后增强整个消失——实测过
+    // 「明明不卡却莫名回退」。改为只看两种真实卡顿信号：
+    //   ① 渲染时间已超过整个帧间隔（必然掉帧，只是还没反映到计数）；
+    //   ② frame-drop-count 增速 > 1%/秒（mpv 自己报的掉帧）。
+    // 「渲染占 30% 但帧率正常」不再触发，交由用户的主观流畅度决定。
+    final frameBudgetMs = 1000 / fps / state.rate;
+    var overloaded = samples.length >= 5 && p95 > frameBudgetMs;
     final rawDrops = _mpv!.read('frame-drop-count');
     if (rawDrops is num) {
       final drops = rawDrops.toInt();
@@ -943,13 +1025,25 @@ class VideoEnhancementController extends ChangeNotifier {
     }
     _overloadedSince ??= now;
     if (now.difference(_overloadedSince!) < const Duration(seconds: 10)) return;
-    _costLimit = math.min(
-      _costLimit,
-      selected.backend == VideoEnhancementBackend.hardware
-          ? 2
-          : selected.backend.cost - 1,
-    );
-    _downgradeReason = '本集已为保持流畅降低增强';
+    // [阶梯降档·+142] 过载确认后先降一档 Anime4K（质量→轻量→标准→均衡→
+    // 极简），到极简仍过载才走原来的 costLimit 降级（放弃 anime 回缩放）。
+    // 用户偏好不被写入：_tierOverride 是会话级，动设置或换集即清除。
+    final cheaper =
+        selected.backend == VideoEnhancementBackend.anime
+            ? nextCheaperTier(_effectiveTier)
+            : null;
+    if (cheaper != null) {
+      _tierOverride = cheaper;
+      _downgradeReason = '本集已为保持流畅降档到${cheaper.label}';
+    } else {
+      _costLimit = math.min(
+        _costLimit,
+        selected.backend == VideoEnhancementBackend.hardware
+            ? 2
+            : selected.backend.cost - 1,
+      );
+      _downgradeReason = '本集已为保持流畅降低增强';
+    }
     ignorePerformance();
     _schedule(immediate: true);
   }

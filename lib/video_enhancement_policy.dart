@@ -120,6 +120,19 @@ class VideoEnhancementDecision {
   int get hashCode => Object.hash(backend, output, reason);
 }
 
+/// 性能看门狗阶梯降档用的「下一个更便宜档位」（+142）。
+///
+/// 依赖 [VideoEnhancementTier] 的声明顺序即算力升序（见该枚举的文档约定）：
+/// 极简 → 均衡 → 标准 → 轻量 → 质量。看门狗确认过载后逐级下移，到极简仍
+/// 过载才由调用方放弃 anime 后端（降 costLimit 回落高质量缩放），避免
+/// 「一卡顿就整个失去增强」的断崖式体验。
+///
+/// 返回 null 表示已在最低档（极简），没有更便宜的档可降。
+VideoEnhancementTier? nextCheaperTier(VideoEnhancementTier tier) {
+  final index = VideoEnhancementTier.values.indexOf(tier);
+  return index > 0 ? VideoEnhancementTier.values[index - 1] : null;
+}
+
 bool videoHasAnimationTags(String category, List<String> tags) => RegExp(
   r'漫剧|动漫|动画|二次元|\banime\b|\banimation\b|comic_series',
   caseSensitive: false,
@@ -191,6 +204,7 @@ VideoEnhancementDecision chooseVideoEnhancement({
   required double rate,
   required int costLimit,
   required Set<VideoEnhancementBackend> rejected,
+  Size? fixedSurface,
   bool opaque8Bit = false,
 }) {
   const original = VideoEnhancementBackend.original;
@@ -234,14 +248,16 @@ VideoEnhancementDecision chooseVideoEnhancement({
     math.max(2, (source.width * scale).round() ~/ 2 * 2).toDouble(),
     math.max(2, (source.height * scale).round() ~/ 2 * 2).toDouble(),
   );
-  // [移植改造·安卓专用] 安卓端不放大渲染表面（原因详见 video_output_size.dart
+  // [移植改造·安卓专用] 安卓端默认不放大渲染表面（原因详见 video_output_size.dart
   /// 类注释：放大表面会引发 media_kit 的 VO 重建 + seek 转圈、与 media_kit 自身
   /// videoParams 监听乒乓、并误触增强自愈把后端拉黑）。因此返回给调用方的
-  /// output 必须是"实际表面尺寸"——安卓上即视频显示尺寸，桌面端仍为放大尺寸。
+  /// output 必须是"实际表面尺寸"——安卓默认即视频显示尺寸，桌面端仍为放大尺寸；
+  /// 宿主启用固定表面后，安卓表面为一次性锁定的放大值（由 fixedSurface 传入），
+  /// 语义不变：output 恒为实际表面。
   /// video_enhancement.dart 的 _monitor 用 output 与实际表面
   /// （rect / osd-dimensions）比对来确认增强生效；安卓若返回放大尺寸，
   /// sizeMatches 永远不成立，连续 5 次即 _failBackend 拉黑后端。
-  final surfaceOutput = android ? source : output;
+  final surfaceOutput = fixedSurface ?? (android ? source : output);
   // [结构重构·2026-10] 高级档：用户明确要求"直接开启 Anime4K"，全部绕过
   // 自动判断——动画标签、温控/headroom、播放倍速、显存预算、targetScale、
   // rejected 拉黑、色彩/GPU/GLES 预检一概不看。
@@ -249,8 +265,10 @@ VideoEnhancementDecision chooseVideoEnhancement({
   // 运行时若 shader 编译/渲染失败，由 VideoEnhancementController 的
   // _onLog/handlePlaybackError -> _failBackend 兜底（4 次后熔断暂停），
   // 不依赖本函数预判。
-  // 安卓端 scale/maxPixels 上限对渲染无实际影响（表面恒为源尺寸、shader
-  // 内部恒按 2× 源渲染）；桌面端沿用放大的 output，与上游语义一致。
+  // 安卓端默认表面恒为源尺寸，scale/maxPixels 上限对渲染无实际影响（shader
+  // 内部恒按 2× 源渲染）；固定表面启用后表面大于源、Upscale 链生效，显存
+  // 预算改按 surfaceOutput 计入（见下方 neuralMemory）。桌面端沿用放大的
+  // output，与上游语义一致。
   if (preferences.mode == VideoEnhancementMode.advanced) {
     return VideoEnhancementDecision(
       VideoEnhancementBackend.anime,
@@ -280,8 +298,10 @@ VideoEnhancementDecision chooseVideoEnhancement({
     output.width / source.width,
     output.height / source.height,
   );
-  // [移植改造·安卓专用] ratio 是"表面放大倍率"；安卓表面恒为源尺寸时比值恒为 1，
-  /// 是否值得上神经超分改看"显示端需要的放大倍率" targetScale（视口/源）。
+  // [移植改造·安卓专用] ratio 是"表面放大倍率"代理；安卓默认表面恒为源尺寸、
+  /// 该代理失效，是否值得上神经超分改看"显示端需要的放大倍率" targetScale
+  /// （视口/源）——固定表面启用后表面虽大于源，但神经增强的收益仍取决于显示
+  /// 端是否需要放大，故继续用 targetScale，与表面放大倍率保持解耦。
   /// 桌面端语义不变（仍看 ratio）。
   final upscale = android ? targetScale : ratio;
   if (upscale <= 1.2 || preferences.mode == VideoEnhancementMode.economy) {
@@ -340,10 +360,12 @@ VideoEnhancementDecision chooseVideoEnhancement({
       backend.cost <= limit && !rejected.contains(backend);
   final memory = android ? (power.lowMemory ? 64 : 128) : 512;
   // [移植改造·安卓专用] 显存预算第二项（输出 FBO）按 surfaceOutput 计算：
-  // 安卓端表面恒为源尺寸，而 Anime4K 链内部按 2× 源渲染，成本只与源分辨率
+  // 安卓端默认表面恒为源尺寸，而 Anime4K 链内部按 2× 源渲染，成本只与源分辨率
   // 相关、与视口无关。若沿用视口放大后的 output，全屏时预算会无谓爆掉，
   // 表现为"半屏能超分、全屏只剩高质量缩放"。桌面端 surfaceOutput == output，
-  // 行为与上游一致。
+  // 行为与上游一致。固定表面启用后 surfaceOutput 为锁定的大表面，预算随之
+  // 抬高，超大表面会像大全屏视口一样把预算撑爆、自然回退缩放（见
+  // test/video_enhancement_policy_test.dart 的固定表面 group）。
   final neuralMemory =
       (pixels * 8 * 18 + surfaceOutput.width * surfaceOutput.height * 8 * 3) /
       (1024 * 1024);

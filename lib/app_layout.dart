@@ -6,7 +6,7 @@ import 'package:flutter/services.dart';
 
 export 'app_build.dart';
 
-const appVersion = '0.2.73';
+const appVersion = '0.2.74';
 
 ThemeData televisionTheme(ThemeData theme) {
   final colors = theme.colorScheme;
@@ -49,10 +49,19 @@ class AppDevice {
   final String version;
   static const channel = MethodChannel('duanju/device');
 
+  /// 最近一次 [detect] 的结果（失败时即当次的 fallback）。
+  ///
+  /// main() 在 runApp 前 await 过一次 [detect]，因此任何界面构建时该值必然
+  /// 已就绪。供拿不到 BuildContext 的场景（如 PlayerScreen.initState）同步
+  /// 读取电视端判定——AppLayout.isTelevision 依赖 InheritedWidget，在
+  /// initState 里不可用。
+  static AppDevice? cached;
+
   static Future<AppDevice> detect({
     AppDevice fallback = const AppDevice(),
   }) async {
     if (defaultTargetPlatform != TargetPlatform.android) {
+      cached = const AppDevice();
       return const AppDevice();
     }
     try {
@@ -60,19 +69,27 @@ class AppDevice {
           .invokeMapMethod<String, dynamic>('deviceInfo')
           .timeout(const Duration(seconds: 2));
       final television = data?['television'];
-      if (television is! bool) return fallback;
+      if (television is! bool) {
+        cached = fallback;
+        return fallback;
+      }
       final version = data?['version'];
-      return AppDevice(
+      final detected = AppDevice(
         television: television,
         version: version is String && version.isNotEmpty
             ? version
             : fallback.version,
       );
+      cached = detected;
+      return detected;
     } on PlatformException {
+      cached = fallback;
       return fallback;
     } on MissingPluginException {
+      cached = fallback;
       return fallback;
     } on TimeoutException {
+      cached = fallback;
       return fallback;
     }
   }

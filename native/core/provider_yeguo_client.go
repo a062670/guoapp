@@ -253,11 +253,10 @@ func (client *yeguoAPIClient) requestClient() *http.Client {
 			}
 		}
 		transport := http.DefaultTransport.(*http.Transport).Clone()
+		// [+145] 曾按 cfg.InsecureTLS 开 InsecureSkipVerify；该标志桥接层与
+		// 用户配置均不设置（仅 network_media_test.go 的自签证书夹具用），
+		// 野果接口恒走完整证书校验。删除死分支，避免安全审查反复误报。
 		transport.TLSClientConfig = &tls.Config{MinVersion: tls.VersionTLS12}
-		if client.downloader.cfg.InsecureTLS {
-			transport.TLSClientConfig = transport.TLSClientConfig.Clone()
-			transport.TLSClientConfig.InsecureSkipVerify = true
-		}
 		if client.downloader.proxyRouter != nil {
 			transport.Proxy = client.downloader.proxyRouter.proxy
 		}

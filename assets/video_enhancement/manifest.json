@@ -68,6 +68,13 @@
       "license": "MIT",
       "note": "上游原版（+87 引入的轻量档链）。WHEN 指令全部保留：安卓端表面恒源尺寸（+82 决策），mpv 自动跳过 Upscale/AutoDownscalePre pass，仅 Clamp_Highlights + Restore_CNN 生效（同分辨率重建/降噪，替代 +85/+86 的 Upscale roundtrip 方案）；桌面端表面仍放大 2×，全链生效。顺序须与 lib/video_enhancement_assets.dart 的 animeChain 一致。"
     },
+    "Anime4K_Upscale_Denoise_CNN_x2_S.glsl": {
+      "sha256": "1a45ad3aa20d8368399f2fd46791deed957c2fd0a4afd131cc92516827abab93",
+      "bytes": 18667,
+      "source": "https://github.com/bloc97/Anime4K/blob/7684e9586f8dcc738af08a1cdceb024cc184f426/glsl/Upscale%2BDenoise/Anime4K_Upscale_Denoise_CNN_x2_S.glsl",
+      "license": "MIT",
+      "note": "上游原版（+143 引入的极简超分档链）。Upscale_S 的 Denoise 训练版本：HOOK/WHEN(1.2)/SAVE 名逐字一致，结构与 Upscale_S 完全相同（972 MAC/px、63 采样/px、5 pass），可直接顶替链里的 Upscale_S，_monitor 的 Depth-to-Space 判定与 _isOwnPass 的 Anime4K 匹配零改动。官方 Mode C 即以它开头（定制规则：不以 Restore 开头的链必须以 Upscale_Denoise 或 Denoise 开头，因视频压缩皆有损）；代价是官方定位为低退化内容，重压缩片源的 ringing 放大风险高于有 Restore 兜底的链，靠 Denoise 训练 + Clamp De-Ring 兜底。顺序须与 lib/video_enhancement_assets.dart 的 animeChainMinimalUpscale 一致。"
+    },
     "Anime4K_Restore_CNN_VL.glsl": {
       "sha256": "35036722733305cd4d4e57660b883bbe2569ba2914033c254327107d7b77e35e",
       "bytes": 144075,

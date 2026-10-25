@@ -13,6 +13,7 @@ import 'package:media_kit/media_kit.dart';
 ///   - 安卓：是否上神经超分只看 targetScale（视口/源），与表面放大倍率解耦；
 ///   - 安卓：显存预算只跟源分辨率相关，半屏/全屏决策一致（进全屏不重新 apply）；
 ///   - 桌面：行为与上游一致，output 仍为放大后的尺寸。
+///   - 固定表面启用后：安卓 output 恒为固定表面（与视口/平台无关），见文末 group。
 VideoParams params({required int width, required int height, int rotate = 0}) =>
     VideoParams(
       pixelformat: 'yuv420p',
@@ -42,6 +43,7 @@ VideoEnhancementDecision decide({
   double rate = 1.0,
   Set<VideoEnhancementBackend> rejected = const {},
   int costLimit = 4,
+  Size? fixedSurface,
 }) => chooseVideoEnhancement(
   preferences: preferences,
   parameters: parameters,
@@ -57,6 +59,7 @@ VideoEnhancementDecision decide({
   rate: rate,
   costLimit: costLimit,
   rejected: rejected,
+  fixedSurface: fixedSurface,
   opaque8Bit: false,
 );
 
@@ -307,27 +310,144 @@ void main() {
   });
 
   group('增强档位（2026-10 tier 新增）', () {
-    test('默认 lite，与 +87 起的默认链一致', () {
+    test('默认 balanced，+144 起默认档由 lite 改为 balanced', () {
       expect(
         const VideoEnhancementPreferences().tier,
-        VideoEnhancementTier.lite,
+        VideoEnhancementTier.balanced,
       );
     });
 
-    test('极简档是 Clamp + S 档重建，pass 数明显少于轻量档', () {
+    test('极简档是 Clamp + S 档重建，pass 数明显少于精细档', () {
       expect(VideoEnhancementAssets.animeChainMinimal, [
         'Anime4K_Clamp_Highlights.glsl',
         'Anime4K_Restore_CNN_S.glsl',
       ]);
-      // 轻量档在安卓端真正执行的是 Clamp + M + S，极简档只保留 S。
+      // 精细档在安卓端真正执行的是 Clamp + M + S，极简档只保留 S。
       expect(
         VideoEnhancementAssets.animeChainMinimal.length,
-        lessThan(VideoEnhancementAssets.animeChainLite.length),
+        lessThan(VideoEnhancementAssets.animeChainFine.length),
       );
       expect(
         VideoEnhancementAssets.animeChainMinimal,
         isNot(contains('Anime4K_Restore_CNN_M.glsl')),
       );
+    });
+
+    // [档位扩展·+142] 均衡/标准两档的链内容：均衡 = Clamp + S 重建 + S 超分
+    // （有 Restore 兜底的最便宜真超分链），标准 = Clamp + M 重建 + S 超分。
+    // 两者都必须带 Upscale_S——否则固定表面下会重蹈 +141 的覆辙（期望
+    // Depth-to-Space 却拿不到，_monitor 误报 render-pass 拉黑后端）。
+    test('均衡档是 Clamp + S 重建 + S 超分，且成本低于标准档', () {
+      expect(VideoEnhancementAssets.animeChainBalanced, [
+        'Anime4K_Clamp_Highlights.glsl',
+        'Anime4K_Restore_CNN_S.glsl',
+        'Anime4K_Upscale_CNN_x2_S.glsl',
+      ]);
+      expect(VideoEnhancementAssets.animeChainStandard, [
+        'Anime4K_Clamp_Highlights.glsl',
+        'Anime4K_Restore_CNN_M.glsl',
+        'Anime4K_Upscale_CNN_x2_S.glsl',
+      ]);
+      // 均衡只多一个 S 重建文件；标准比均衡多一组 M 重建（6 层）。
+      expect(
+        VideoEnhancementAssets.animeChainStandard.length,
+        VideoEnhancementAssets.animeChainBalanced.length,
+      );
+      expect(
+        VideoEnhancementAssets.animeChainBalanced,
+        isNot(contains('Anime4K_Restore_CNN_M.glsl')),
+      );
+      // 两档都少于精细档（精细 = 7 个文件，含两个 AutoDownscalePre）。
+      expect(
+        VideoEnhancementAssets.animeChainBalanced.length,
+        lessThan(VideoEnhancementAssets.animeChainFine.length),
+      );
+    });
+
+    // [极简超分档·+143] 与极简档同价（都是 2 文件、972 MAC/px）但把算力
+    // 花在 2× 超分上：Upscale_Denoise_S 是官方 Mode C 开链组件（无 Restore
+    // 链必须以 Upscale_Denoise/Denoise 开头），其 HOOK/WHEN/SAVE 与
+    // Upscale_S 逐字一致，固定表面下同样产出 Depth-to-Space，_monitor
+    // 的 expectsUpscale（_appliedTier != minimal）天然为 true。
+    test('极简超分档是 Clamp + Denoise 版超分，无 Restore 但与极简档同价', () {
+      expect(VideoEnhancementAssets.animeChainMinimalUpscale, [
+        'Anime4K_Clamp_Highlights.glsl',
+        'Anime4K_Upscale_Denoise_CNN_x2_S.glsl',
+      ]);
+      // 与极简档同为 2 文件；不含任何 Restore，也不含普通版 Upscale_S。
+      expect(
+        VideoEnhancementAssets.animeChainMinimalUpscale.length,
+        VideoEnhancementAssets.animeChainMinimal.length,
+      );
+      expect(
+        VideoEnhancementAssets.animeChainMinimalUpscale,
+        isNot(contains('Anime4K_Restore_CNN_S.glsl')),
+      );
+      expect(
+        VideoEnhancementAssets.animeChainMinimalUpscale,
+        isNot(contains('Anime4K_Upscale_CNN_x2_S.glsl')),
+      );
+      // 比均衡档少一个 Restore_S 文件（超分网络内置降噪，无需 Restore 兜底）。
+      expect(
+        VideoEnhancementAssets.animeChainMinimalUpscale.length,
+        lessThan(VideoEnhancementAssets.animeChainBalanced.length),
+      );
+    });
+
+    test('均衡/标准/极简超分档往返序列化保持', () {
+      for (final tier in const [
+        VideoEnhancementTier.balanced,
+        VideoEnhancementTier.standard,
+        VideoEnhancementTier.minimalUpscale,
+      ]) {
+        final preferences = VideoEnhancementPreferences(
+          mode: VideoEnhancementMode.advanced,
+          tier: tier,
+        );
+        expect(
+          VideoEnhancementPreferences.fromJson(preferences.toJson()).tier,
+          tier,
+        );
+      }
+    });
+
+    test('档位声明顺序即成本升序：质量 > 轻量 > 标准 > 均衡 > 极简超分 > 极简', () {
+      expect(VideoEnhancementTier.values, [
+        VideoEnhancementTier.minimal,
+        VideoEnhancementTier.minimalUpscale,
+        VideoEnhancementTier.balanced,
+        VideoEnhancementTier.standard,
+        VideoEnhancementTier.fine,
+        VideoEnhancementTier.quality,
+      ]);
+    });
+
+    // [阶梯降档·+142] nextCheaperTier 是看门狗降档的唯一依据，其正确性
+    // 直接决定「过载先降档而非直接放弃增强」是否按预期逐级下移。
+    // [极简超分档·+143] 均衡档的下一站是极简超分档而非极简档——同价但
+    // 保留 2× 超分；极简超分档过载再降到极简档（丢失超分换 1 个 pass）。
+    test('nextCheaperTier 逐级下移，极简返回 null', () {
+      expect(
+        nextCheaperTier(VideoEnhancementTier.quality),
+        VideoEnhancementTier.fine,
+      );
+      expect(
+        nextCheaperTier(VideoEnhancementTier.fine),
+        VideoEnhancementTier.standard,
+      );
+      expect(
+        nextCheaperTier(VideoEnhancementTier.standard),
+        VideoEnhancementTier.balanced,
+      );
+      expect(
+        nextCheaperTier(VideoEnhancementTier.balanced),
+        VideoEnhancementTier.minimalUpscale,
+      );
+      expect(
+        nextCheaperTier(VideoEnhancementTier.minimalUpscale),
+        VideoEnhancementTier.minimal,
+      );
+      expect(nextCheaperTier(VideoEnhancementTier.minimal), isNull);
     });
 
     test('极简档往返序列化保持，且不影响 mode/content', () {
@@ -340,7 +460,7 @@ void main() {
         VideoEnhancementPreferences.fromJson(preferences.toJson()),
         preferences,
       );
-      final switched = preferences.copyWith(tier: VideoEnhancementTier.lite);
+      final switched = preferences.copyWith(tier: VideoEnhancementTier.fine);
       expect(switched.mode, VideoEnhancementMode.advanced);
       expect(switched.content, VideoEnhancementContent.animation);
     });
@@ -356,17 +476,29 @@ void main() {
       );
     });
 
-    test('旧 JSON 无 tier 键回落 lite，非法值同样回落', () {
+    test('旧 JSON 无 tier 键回落 balanced，非法值同样回落', () {
       expect(
         VideoEnhancementPreferences.fromJson({'mode': 'advanced'}).tier,
-        VideoEnhancementTier.lite,
+        VideoEnhancementTier.balanced,
       );
       expect(
         VideoEnhancementPreferences.fromJson({
           'mode': 'advanced',
           'tier': 'garbage',
         }).tier,
-        VideoEnhancementTier.lite,
+        VideoEnhancementTier.balanced,
+      );
+    });
+
+    // [+144 更名迁移] lite 更名为 fine：显式存过 'lite' 的老用户必须继续
+    // 映射到精细档，而不是掉回落 Default（balanced）。
+    test("旧 JSON 的 'lite' 经别名迁移到 fine", () {
+      expect(
+        VideoEnhancementPreferences.fromJson({
+          'mode': 'advanced',
+          'tier': 'lite',
+        }).tier,
+        VideoEnhancementTier.fine,
       );
     });
 
@@ -382,6 +514,85 @@ void main() {
       expect(switched.content, VideoEnhancementContent.animation);
       expect(switched.tier, VideoEnhancementTier.quality);
       expect(switched, isNot(preferences));
+    });
+  });
+
+  /// 固定输出表面（VideoFixedSurface，2026-10 落地）后的策略语义。
+  ///
+  /// 背景：安卓端默认表面恒为源尺寸，Anime4K 的 Upscale pass 因 WHEN 条件被
+  /// mpv 跳过。启用固定表面后，fork 在首次 videoParams 事件上把表面一次性放大
+  /// 到「源 × 倍率」并锁定，策略层拿到的 surfaceOutput 即该实际表面——
+  /// 这里固定「output 恒为传入的 fixedSurface、与视口/平台无关」的契约，
+  /// 它是 video_enhancement.dart _monitor 的 sizeMatches / expectsUpscale
+  /// 不误拉黑后端的前提。
+  group('固定表面（fixedSurface）语义', () {
+    final source = params(width: 544, height: 960);
+
+    test('安卓：output 恒为固定表面，半屏/全屏一致', () {
+      const surface = Size(1088, 1920); // 544×960 × 2
+      for (final viewport in const [Size(1080, 1344), Size(1080, 2400)]) {
+        final decision = decide(
+          parameters: source,
+          viewport: viewport,
+          android: true,
+          fixedSurface: surface,
+        );
+        expect(decision.backend, VideoEnhancementBackend.anime);
+        expect(decision.output, surface);
+      }
+    });
+
+    test('固定表面=源尺寸时退回默认语义（同分辨率重建）', () {
+      const surface = Size(544, 960);
+      final decision = decide(
+        parameters: source,
+        viewport: const Size(1080, 1344),
+        android: true,
+        fixedSurface: surface,
+      );
+      expect(decision.backend, VideoEnhancementBackend.anime);
+      expect(decision.output, surface);
+    });
+
+    test('固定表面过大撑爆显存预算时回落 scaling（预算含表面项）', () {
+      // 890×1600 源 + 2560×1440 表面：神经项 ~280MB、ravu 项 ~193MB，
+      // 均超安卓 128MB 预算，与视口无关地回落到高质量缩放。
+      const surface = Size(2560, 1440);
+      final decision = decide(
+        parameters: params(width: 890, height: 1600),
+        viewport: const Size(1080, 2400),
+        android: true,
+        fixedSurface: surface,
+      );
+      expect(decision.backend, VideoEnhancementBackend.scaling);
+      expect(decision.output, surface);
+    });
+
+    test('桌面端同样以 fixedSurface 为 output（策略与平台无关）', () {
+      const surface = Size(1088, 1920);
+      final decision = decide(
+        parameters: source,
+        viewport: const Size(1080, 1344),
+        android: false,
+        fixedSurface: surface,
+      );
+      expect(decision.backend, VideoEnhancementBackend.anime);
+      expect(decision.output, surface);
+    });
+
+    test('增强关闭时固定表面不生效', () {
+      const surface = Size(1088, 1920);
+      final decision = decide(
+        parameters: source,
+        viewport: const Size(1080, 1344),
+        android: true,
+        preferences: const VideoEnhancementPreferences(
+          mode: VideoEnhancementMode.off,
+        ),
+        fixedSurface: surface,
+      );
+      expect(decision.backend, VideoEnhancementBackend.original);
+      expect(decision.output, null);
     });
   });
 }
