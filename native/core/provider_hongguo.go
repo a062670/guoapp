@@ -235,9 +235,10 @@ func (d *Downloader) resolveHongguoMedia(ctx context.Context, task Task) (provid
 			return providerMedia{}, ctxErr
 		}
 	}
-	// 聚合错误沿用改造前的三段文案（App / 网页 / 备用），
-	// 保证既有日志与排查习惯不受本次改造影响。
-	return providerMedia{}, fmt.Errorf("红果 App 取流失败：%v；网页取流失败：%v；备用取流失败：%w",
+	// 聚合错误按注册表顺序列出四条线路（drpys / App / 网页 / 备用），
+	// 后三段沿用改造前的文案，保证既有日志与排查习惯不受影响。
+	return providerMedia{}, fmt.Errorf("红果 drpys 取流失败：%v；App 取流失败：%v；网页取流失败：%v；备用取流失败：%w",
+		publicError(routeErrorOrSkip(errs[hongguoRouteDrpy])),
 		publicError(routeErrorOrSkip(errs[hongguoRouteApp])),
 		publicError(routeErrorOrSkip(errs[hongguoRouteWeb])),
 		routeErrorOrSkip(errs[hongguoRouteDjapi]))
